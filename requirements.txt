@@ -1,0 +1,8 @@
+# Core (always needed)
+aiohttp>=3.9
+numpy
+
+# Backend-specific (only install what you actually wire up)
+# pyrealsense2          # MultiRealSenseSource
+pybullet                # PybulletPointCloudSource, PybulletRobotDriver
+# aero-open-sdk         # AeroArmDriver (finger half)

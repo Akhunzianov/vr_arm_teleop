@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "teleop-mock",
+      "runtimeExecutable": "/home/renat/robotics/ysda_emb_ai_course/vr_tendon_arm_teleop/.venv/bin/python",
+      "runtimeArgs": ["-m", "webxr_app", "--pc-backend", "mock", "--robot-backend", "noop", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}
