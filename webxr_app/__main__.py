@@ -5,8 +5,8 @@ This is the *only* file that imports from both ``teleop_core`` and
 
 Usage:
     python -m webxr_app --pc-backend mock --robot-backend pybullet
-    python -m webxr_app --pc-backend realsense --robot-backend aero \\
-        --cameras config/cameras.json
+    python -m webxr_app --pc-backend hardware --robot-backend aero \\
+        --cameras config/hardware_cameras.json
 """
 
 from __future__ import annotations
@@ -22,7 +22,8 @@ from teleop_core import (
     Pose, ServerConfig, SafetyConfig, TeleopServer, Workspace,
 )
 from teleop_backends.pointcloud import (
-    MockPointCloudSource, MultiRealSenseSource, PybulletPointCloudSource,
+    HardwarePointCloudSource, MockPointCloudSource, MultiRealSenseSource,
+    PybulletPointCloudSource,
 )
 from teleop_backends.robot import (
     AeroArmDriver, FloatingWristDriver, NoopRobotDriver, PybulletRobotDriver,
@@ -33,6 +34,10 @@ def _make_pc_source(name: str, args: argparse.Namespace):
     """Resolve --pc-backend into a PointCloudSource instance."""
     if name == "mock":
         return MockPointCloudSource()
+    if name == "hardware":
+        if args.cameras is None:
+            raise SystemExit("--pc-backend hardware requires --cameras <path>")
+        return HardwarePointCloudSource.from_config_file(args.cameras)
     if name == "realsense":
         if args.cameras is None:
             raise SystemExit("--pc-backend realsense requires --cameras <path>")
@@ -49,11 +54,10 @@ def _make_robot_driver(name: str, args: argparse.Namespace):
     if name == "pybullet":
         urdf = args.urdf
         if urdf is None:
-            # Default to the URDF shipped in-tree (symlinked from the old
-            # project for v1; will be copied properly when we cut hardware
-            # loose from vr_tendon_arm_teleop).
+            # Canonical full robot model: arm + prehand D405 + right hand,
+            # with simplified collisions for stable PyBullet simulation.
             urdf = Path(__file__).resolve().parent.parent / "urdf_rc5_right_hand" \
-                / "Robot_with_right_hand_cor.urdf"
+                / "urdf_with_simple_collisions.urdf"
         home_q = None
         if args.home_joints is not None:
             home_q = tuple(float(s) for s in args.home_joints.split(","))
@@ -109,14 +113,15 @@ def _make_workspace(args: argparse.Namespace, home: Pose | None) -> Workspace:
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pc-backend",
-                    choices=("mock", "realsense", "pybullet"), default="mock")
+                    choices=("mock", "hardware", "realsense", "pybullet"),
+                    default="mock")
     ap.add_argument("--robot-backend",
                     choices=("noop", "pybullet", "floating", "aero"),
                     default="pybullet")
 
     # Backend-specific knobs:
     ap.add_argument("--cameras", type=Path, default=None,
-                    help="cameras.json for --pc-backend realsense")
+                    help="camera config JSON for --pc-backend hardware/realsense")
     ap.add_argument("--arm-ip", default="10.10.10.10",
                     help="RC5 IP address for --robot-backend aero (default 10.10.10.10)")
     ap.add_argument("--aero-port", default=None,

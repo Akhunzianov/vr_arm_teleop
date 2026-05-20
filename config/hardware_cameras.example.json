@@ -1,0 +1,44 @@
+{
+  "workspace_crop": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [0.5, 0.5, 0.5]
+  },
+  "max_points": 200000,
+  "cameras": [
+    {
+      "name": "rs-front",
+      "type": "realsense",
+      "serial": "REALSENSE_SERIAL",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "downsample": 4,
+      "z_min": 0.15,
+      "z_max": 2.5,
+      "calibrated": false,
+      "world_from_camera": [
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+      ]
+    },
+    {
+      "name": "zed-overhead",
+      "type": "zed2i",
+      "serial": "12345678",
+      "resolution": "HD720",
+      "fps": 30,
+      "downsample": 4,
+      "z_min": 0.2,
+      "z_max": 3.0,
+      "calibrated": false,
+      "world_from_camera": [
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+      ]
+    }
+  ]
+}

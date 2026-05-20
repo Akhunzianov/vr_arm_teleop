@@ -26,7 +26,9 @@ Implemented:
   dataclasses + JSON codec, and `TeleopServer` orchestrating the
   four async loops (control, command, point cloud, safety stub).
 - **Point cloud backend** — `MockPointCloudSource` (synthetic
-  animated cloud).
+  animated cloud), plus hardware capture/fusion plumbing for mixed
+  RealSense and ZED 2i camera configs. Real hardware clouds are gated
+  from AR display until camera-to-robot calibration is marked valid.
 - **Robot backends** — `NoopRobotDriver` (logs commands),
   `PybulletRobotDriver` (full 6-DoF arm via `calculateInverseKinematics`
   + tendon-coupled hand fingers, URDF in `urdf_rc5_right_hand/`),
@@ -61,7 +63,7 @@ Implemented:
 
 Not implemented yet — see [ROADMAP.md](ROADMAP.md):
 
-- `MultiRealSenseSource` (real cameras)
+- Camera-to-robot calibration for physically aligned hardware point clouds
 - `PybulletPointCloudSource` (depth render from sim as a fake sensor)
 - `AeroArmDriver` (real arm — hardware not on hand)
 - `SafetyMonitor.step` + a couple of state-transition hooks in
@@ -132,15 +134,34 @@ python -m webxr_app --pc-backend mock --robot-backend pybullet
 
 | flag | default | meaning |
 |---|---|---|
-| `--pc-backend` | `mock` | `mock` / `realsense` (stub) / `pybullet` (stub) |
+| `--pc-backend` | `mock` | `mock` / `hardware` / `realsense` / `pybullet` (stub) |
 | `--robot-backend` | `pybullet` | `noop` / `pybullet` / `floating` / `aero` (stub) |
 | `--urdf` | shipped URDF | URDF path for pybullet/floating |
 | `--pybullet-gui` | off | Show pybullet GUI window |
 | `--home-joints` | derived | 6 comma-separated radians, e.g. `0,-2.0,1.8,-1.4,1.57,0` |
-| `--cameras` | – | `cameras.json` for `--pc-backend realsense` |
+| `--cameras` | – | camera config JSON for `--pc-backend hardware` or `realsense` |
 | `--workspace` | derived from home | `workspace.json` with `{"min":[x,y,z],"max":[x,y,z]}` |
 | `--port` | `8000` | HTTP/HTTPS port |
 | `--cert` / `--key` | – | TLS cert + key (required for non-localhost Quest) |
+
+### Hardware camera config
+
+Use `--pc-backend hardware --cameras config/hardware_cameras.json` to
+read any enabled mix of RealSense and ZED 2i cameras. The legacy
+`--pc-backend realsense` path uses the same config parser but rejects
+non-RealSense cameras.
+
+Each camera entry includes `type` (`realsense` or `zed2i`),
+`serial`, stream settings, `z_min` / `z_max`, `downsample`,
+`calibrated`, and a 4x4 `world_from_camera` matrix. Disabled cameras
+are ignored.
+
+If any enabled camera has `calibrated: false`, the backend still opens
+the cameras for diagnostics but returns no point-cloud frames to the AR
+client. This is intentional: without camera-to-robot calibration, the
+cloud cannot be displayed in a physically meaningful robot/world frame.
+Use [config/hardware_cameras.example.json](config/hardware_cameras.example.json)
+as the starting shape.
 
 ---
 
@@ -248,7 +269,8 @@ teleop_core/
 teleop_backends/
   pointcloud/
     mock.py              synthetic animated cloud
-    realsense_multi.py   N RealSenses fused into world frame [stub]
+    hardware.py          mixed RealSense/ZED 2i capture + fusion
+    realsense_multi.py   legacy RealSense-only wrapper
     pybullet_render.py   pybullet depth-render as a fake sensor [stub]
   robot/
     noop.py                  logs commands, never moves

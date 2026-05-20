@@ -4,7 +4,9 @@ numpy
 scipy                   # AeroArmDriver: quaternion ↔ rotation-vector conversion
 
 # Backend-specific (only install what you actually wire up)
-# pyrealsense2          # MultiRealSenseSource
+# opencv-contrib-python # ChArUco calibration script (cv2.aruco)
+# pyrealsense2          # RealSensePointCloudReader on Linux capture hosts
+# pyzed.sl              # ZED SDK Python API, installed via Stereolabs SDK
 pybullet                # PybulletPointCloudSource, PybulletRobotDriver
 # aero-open-sdk         # AeroArmDriver (finger half)
 # ros2_rc5_control_pregrasp/python_api  # AeroArmDriver (arm half, path-based)

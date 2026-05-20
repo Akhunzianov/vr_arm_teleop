@@ -19,7 +19,7 @@ from teleop_core.robot import RobotCommand
 
 
 URDF = Path(__file__).resolve().parents[1] / "urdf_rc5_right_hand" \
-    / "Robot_with_right_hand_cor.urdf"
+    / "urdf_with_simple_collisions.urdf"
 
 
 async def _settle(driver: PybulletRobotDriver, seconds: float) -> None:

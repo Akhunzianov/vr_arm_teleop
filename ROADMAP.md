@@ -22,20 +22,20 @@ loop and the state-transition hooks it relies on.
 Done when: yanking the robot driver offline pops a `fault` overlay
 that the user has to acknowledge.
 
-## 2. Multi-camera RealSense source ⏱ 3h
+## 2. Hardware point-cloud calibration ⏱ TBD
 
-Swap the mock for real cameras.
+Hardware capture/fusion plumbing exists for mixed RealSense and ZED 2i
+configs. The remaining production blocker is camera-to-robot
+calibration; until enabled cameras are marked calibrated, hardware
+capture starts for diagnostics but AR point-cloud display is gated.
 
-- `teleop_backends/pointcloud/realsense_multi.MultiRealSenseSource.*`
-  — `from_config_file`, `start`, `stop`, `grab`.
-- Extrinsics config file: JSON of `{serial: 4x4_matrix}`. For v1,
-  hand-tune by aligning known features in the rendered cloud.
-- Workspace crop *inside the source* — drop points outside the
-  configured box before encoding.
-- Add `pyrealsense2` to `requirements.txt` (currently commented).
+- Replace hand-entered `world_from_camera` matrices with a calibration
+  workflow that estimates camera-to-robot transforms.
+- Persist calibrated transforms into the hardware camera config.
+- Add a calibration QA view or procedure before allowing AR display.
 
-Done when: with N RealSenses on the workspace, the fused cloud in VR
-looks like the actual workspace.
+Done when: with the configured cameras on the workspace, the fused
+cloud aligns with the robot/workspace frame in AR.
 
 ## 3. Pybullet point-cloud source ⏱ 2h
 
