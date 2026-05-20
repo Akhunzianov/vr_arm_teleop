@@ -71,6 +71,17 @@ class CountingPointCloud:
         self.grab_count += 1
         return self.frame
 
+    def dashboard_camera_feeds(self):
+        return [
+            {
+                "name": "d405",
+                "urdf_link": "d405_depth_optical_frame",
+                "url": "/api/cameras/d405/color.jpg",
+                "width": 640,
+                "height": 480,
+            }
+        ]
+
 
 def _workspace():
     return Workspace(
@@ -98,6 +109,15 @@ def test_dashboard_snapshot_contains_model_workspace_robot_and_unaligned_xr():
         assert snap["type"] == "snapshot"
         assert snap["model"]["urdf_url"] == "/robot/robot.urdf"
         assert snap["model"]["urdf_assets_url"] == "/robot/assets/"
+        assert snap["model"]["camera_feeds"] == [
+            {
+                "name": "d405",
+                "urdf_link": "d405_depth_optical_frame",
+                "url": "/api/cameras/d405/color.jpg",
+                "width": 640,
+                "height": 480,
+            }
+        ]
         assert snap["workspace"]["min"] == [-1.0, -2.0, 0.0]
         assert snap["workspace"]["max"] == [1.0, 2.0, 1.0]
         assert snap["robot"]["joints"] == {
@@ -135,6 +155,49 @@ def test_dashboard_xr_pose_stays_unaligned_until_anchor_exists():
     assert snap["xr"]["aligned"] is True
     assert snap["xr"]["head"]["position"] == [0.0, 1.6, 0.0]
     assert snap["xr"]["right_wrist"]["position"] == [0.2, 1.1, -0.3]
+
+
+def test_dashboard_xr_head_survives_missing_hand_and_wrist_curls_are_cached():
+    hub = TelemetryHub(
+        point_cloud_source=CountingPointCloud(),
+        robot_driver=FakeRobot(),
+        workspace=_workspace(),
+        urdf_url="/robot/robot.urdf",
+        urdf_assets_url="/robot/assets/",
+    )
+
+    hub.update_xr_pose(
+        head_position=(0.0, 1.6, 0.0),
+        head_orientation=(0.0, 0.0, 0.0, 1.0),
+        right_wrist_position=(0.2, 1.1, -0.3),
+        right_wrist_orientation=(0.0, 0.0, 0.0, 1.0),
+        valid=False,
+        head_valid=True,
+        right_wrist_curls=(0.1, 0.2, 0.3, 0.4, 0.5),
+        timestamp=10.0,
+    )
+    hub.update_anchor((0.1, 1.0, -0.2), timestamp=11.0)
+
+    snap = hub.snapshot()
+
+    assert snap["xr"]["aligned"] is True
+    assert snap["xr"]["head"]["position"] == [0.0, 1.6, 0.0]
+    assert snap["xr"]["right_wrist"] is None
+
+    hub.update_xr_pose(
+        head_position=(0.0, 1.6, 0.0),
+        head_orientation=(0.0, 0.0, 0.0, 1.0),
+        right_wrist_position=(0.2, 1.1, -0.3),
+        right_wrist_orientation=(0.0, 0.0, 0.0, 1.0),
+        valid=True,
+        head_valid=True,
+        right_wrist_curls=(0.1, 0.2, 0.3, 0.4, 0.5),
+        timestamp=12.0,
+    )
+
+    snap = hub.snapshot()
+
+    assert snap["xr"]["right_wrist"]["curls"] == [0.1, 0.2, 0.3, 0.4, 0.5]
 
 
 def test_multiple_dashboard_cloud_waiters_share_one_grab():

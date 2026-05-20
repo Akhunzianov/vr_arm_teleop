@@ -35,6 +35,30 @@ def _pose_dict(position, orientation, timestamp: float) -> dict[str, Any]:
     }
 
 
+def _dashboard_camera_feeds(source: PointCloudSource) -> list[dict[str, Any]]:
+    feeds = getattr(source, "dashboard_camera_feeds", None)
+    if not callable(feeds):
+        return []
+    raw_feeds = feeds()
+    clean: list[dict[str, Any]] = []
+    for raw in raw_feeds:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        urdf_link = raw.get("urdf_link")
+        url = raw.get("url")
+        if not name or not urdf_link or not url:
+            continue
+        clean.append({
+            "name": str(name),
+            "urdf_link": str(urdf_link),
+            "url": str(url),
+            "width": int(raw.get("width", 0)),
+            "height": int(raw.get("height", 0)),
+        })
+    return clean
+
+
 class TelemetryHub:
     """Caches live setup telemetry and fans it out to read-only clients."""
 
@@ -153,19 +177,28 @@ class TelemetryHub:
         valid: bool,
         timestamp: float,
         right_wrist_curls=None,
+        head_valid: bool | None = None,
     ) -> None:
-        if not valid:
+        if head_valid is None:
+            head_valid = valid
+        if not head_valid and not valid:
             self._xr_pose = None
             return
-        right_wrist = _pose_dict(
-            right_wrist_position,
-            right_wrist_orientation,
-            timestamp,
-        )
-        if right_wrist_curls is not None:
-            right_wrist["curls"] = _vec(right_wrist_curls)
+        right_wrist = None
+        if valid:
+            right_wrist = _pose_dict(
+                right_wrist_position,
+                right_wrist_orientation,
+                timestamp,
+            )
+            if right_wrist_curls is not None:
+                right_wrist["curls"] = _vec(right_wrist_curls)
         self._xr_pose = {
-            "head": _pose_dict(head_position, head_orientation, timestamp),
+            "head": (
+                _pose_dict(head_position, head_orientation, timestamp)
+                if head_valid
+                else None
+            ),
             "right_wrist": right_wrist,
         }
 
@@ -183,6 +216,7 @@ class TelemetryHub:
             "model": {
                 "urdf_url": self._urdf_url,
                 "urdf_assets_url": self._urdf_assets_url,
+                "camera_feeds": _dashboard_camera_feeds(self._pc),
             },
             "workspace": {
                 "min": _vec(self._workspace.min_corner),

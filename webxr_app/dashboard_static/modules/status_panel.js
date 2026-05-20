@@ -41,6 +41,9 @@ export class StatusPanel {
     const xr = snapshot.xr || {};
     const status = snapshot.status || {};
     const jointCount = robot.joints ? Object.keys(robot.joints).length : 0;
+    const cameraFeedCount = Array.isArray(model.camera_feeds)
+      ? model.camera_feeds.length
+      : 0;
     const xrState = xr.aligned ? 'Aligned' : 'XR unaligned';
 
     const robotError = robot.error || 'none';
@@ -48,6 +51,7 @@ export class StatusPanel {
     this._status.innerHTML = `
       <div class="status-group">
         ${row('URDF', model.urdf_url || 'none')}
+        ${row('Camera feeds', cameraFeedCount)}
         ${row('Robot joints', jointCount)}
         ${row('Robot Hz', fmtNumber(status.robot_hz, 1))}
       </div>

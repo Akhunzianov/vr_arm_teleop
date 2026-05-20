@@ -49,13 +49,15 @@ def _base_camera(name, camera_type="realsense", calibrated=True, enabled=True):
 
 
 def test_load_hardware_config_parses_mixed_enabled_cameras(tmp_path):
+    first = _base_camera("rs-front", "realsense")
+    first["urdf_link"] = "d405_depth_optical_frame"
     path = _write_config(
         tmp_path,
         {
             "workspace_crop": {"min": [0, 0, 0], "max": [1, 1, 1]},
             "max_points": 5000,
             "cameras": [
-                _base_camera("rs-front", "realsense"),
+                first,
                 _base_camera("zed-overhead", "zed2i"),
                 _base_camera("rs-disabled", "realsense", enabled=False),
             ],
@@ -74,6 +76,7 @@ def test_load_hardware_config_parses_mixed_enabled_cameras(tmp_path):
     assert config.cameras[0].downsample == 2
     assert config.cameras[0].z_min == 0.2
     assert config.cameras[0].z_max == 1.5
+    assert config.cameras[0].urdf_link == "d405_depth_optical_frame"
 
 
 def test_load_hardware_config_rejects_invalid_transform(tmp_path):
@@ -115,6 +118,40 @@ class FakeReader(CameraPointCloudReader):
 
     async def grab_camera_frame(self):
         return self.frame
+
+
+class FakeJpegReader(FakeReader):
+    def latest_color_jpeg(self):
+        return b"jpeg-bytes"
+
+
+def test_hardware_source_exposes_dashboard_camera_feed_metadata_and_jpeg(tmp_path):
+    camera = _base_camera("d405")
+    camera["urdf_link"] = "d405_depth_optical_frame"
+    path = _write_config(tmp_path, {"cameras": [camera]})
+
+    source = HardwarePointCloudSource.from_config_file(
+        path,
+        reader_factory=lambda _camera: FakeJpegReader(None),
+    )
+
+    async def run():
+        await source.start()
+        try:
+            assert source.dashboard_camera_feeds() == [
+                {
+                    "name": "d405",
+                    "urdf_link": "d405_depth_optical_frame",
+                    "url": "/api/cameras/d405/color.jpg",
+                    "width": 320,
+                    "height": 240,
+                }
+            ]
+            assert source.latest_color_jpeg("d405") == b"jpeg-bytes"
+        finally:
+            await source.stop()
+
+    asyncio.run(run())
 
 
 def test_uncalibrated_enabled_camera_starts_but_gates_display(tmp_path, capsys):

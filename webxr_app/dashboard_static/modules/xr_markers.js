@@ -29,20 +29,32 @@ export class XRMarkers {
   }
 
   update(xr) {
-    if (!xr || !xr.aligned || !xr.anchor || !xr.head || !xr.right_wrist) {
+    if (!xr || !xr.aligned || !xr.anchor || (!xr.head && !xr.right_wrist)) {
       this._aligned = false;
+      this.head.setVisible(false);
+      this.hand.setVisible(false);
       this.group.visible = false;
       return;
     }
     const origin = xr.anchor.vr_position_of_robot_origin;
-    const headPos = robotToThreeVector(helmetToRobotPosition(xr.head.position, origin));
-    const wristPos = robotToThreeVector(
-      helmetToRobotPosition(xr.right_wrist.position, origin),
-    );
-    this.head.setPose(headPos, xr.head.orientation);
-    this.hand.setPose(wristPos, xr.right_wrist.orientation);
-    if (xr.right_wrist.curls) {
-      this.hand.driveCurls(xr.right_wrist.curls);
+    if (xr.head) {
+      const headPos = robotToThreeVector(helmetToRobotPosition(xr.head.position, origin));
+      this.head.setPose(headPos, xr.head.orientation);
+      this.head.setVisible(true);
+    } else {
+      this.head.setVisible(false);
+    }
+    if (xr.right_wrist) {
+      const wristPos = robotToThreeVector(
+        helmetToRobotPosition(xr.right_wrist.position, origin),
+      );
+      this.hand.setPose(wristPos, xr.right_wrist.orientation);
+      if (xr.right_wrist.curls) {
+        this.hand.driveCurls(xr.right_wrist.curls);
+      }
+      this.hand.setVisible(true);
+    } else {
+      this.hand.setVisible(false);
     }
     this._aligned = true;
     this.group.visible = this.enabled;
