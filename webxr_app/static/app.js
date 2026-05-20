@@ -248,6 +248,7 @@ scene.setAnimationLoop((time, frame) => {
     }
     if (yNow && !prevButtons.y) {
       comms.sendJson({ type: 'button', hand: 'left', name: 'y_click', pressed: true });
+      pcView.toggleVisible();
     }
     prevButtons.x = xNow;
     prevButtons.y = yNow;
