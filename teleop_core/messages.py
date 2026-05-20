@@ -28,6 +28,9 @@ class HandStateMsg:
     wrist_position: tuple[float, float, float] = (0.0, 0.0, 0.0)  # world, m
     wrist_orientation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     valid: bool = False
+    head_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    head_orientation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    head_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,9 @@ def decode(text: str):
             wrist_position=tuple(float(v) for v in obj.get("wrist_position", (0.0, 0.0, 0.0))),
             wrist_orientation=tuple(float(v) for v in obj.get("wrist_orientation", (0.0, 0.0, 0.0, 1.0))),
             valid=bool(obj.get("valid", False)),
+            head_position=tuple(float(v) for v in obj.get("head_position", (0.0, 0.0, 0.0))),
+            head_orientation=tuple(float(v) for v in obj.get("head_orientation", (0.0, 0.0, 0.0, 1.0))),
+            head_valid=bool(obj.get("head_valid", False)),
         )
     if cls is ButtonMsg:
         return ButtonMsg(

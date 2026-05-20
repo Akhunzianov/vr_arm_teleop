@@ -1,0 +1,203 @@
+import asyncio
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from teleop_core.point_cloud import PointCloudFrame
+from teleop_core.robot import RobotState
+from teleop_core.server import _resolve_robot_asset_path
+from teleop_core.telemetry import TelemetryHub
+from teleop_core.types import Pose
+from teleop_core.workspace import Workspace
+
+
+def test_robot_state_named_joint_angles_pairs_names_with_values():
+    state = RobotState(
+        wrist_pose=Pose.identity(frame="world"),
+        joint_angles=np.array([1.25, -0.5], dtype=np.float32),
+        finger_curls=np.zeros(5, dtype=np.float32),
+        timestamp=time.monotonic(),
+        joint_names=("joint0", "right_index_pip"),
+    )
+
+    assert state.named_joint_angles == {
+        "joint0": 1.25,
+        "right_index_pip": -0.5,
+    }
+
+
+def test_robot_state_named_joint_angles_is_empty_when_lengths_do_not_match():
+    state = RobotState(
+        wrist_pose=Pose.identity(frame="world"),
+        joint_angles=np.array([1.25], dtype=np.float32),
+        finger_curls=np.zeros(5, dtype=np.float32),
+        timestamp=time.monotonic(),
+        joint_names=("joint0", "joint1"),
+    )
+
+    assert state.named_joint_angles == {}
+
+
+class FakeRobot:
+    def __init__(self):
+        self.state = RobotState(
+            wrist_pose=Pose(
+                position=np.array([0.1, 0.2, 0.3], dtype=np.float64),
+                orientation=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+                frame="world",
+            ),
+            joint_angles=np.array([0.4, -0.2], dtype=np.float32),
+            finger_curls=np.array([0.0, 0.1, 0.2, 0.3, 0.4], dtype=np.float32),
+            timestamp=123.0,
+            joint_names=("joint0", "right_index_pip"),
+        )
+
+    async def get_state(self):
+        return self.state
+
+
+class CountingPointCloud:
+    def __init__(self):
+        self.grab_count = 0
+        self.frame = PointCloudFrame(
+            points=np.array([[0.0, 0.0, 0.5]], dtype=np.float32),
+            colors=np.array([[255, 0, 0]], dtype=np.uint8),
+            timestamp=234.0,
+        )
+
+    async def grab(self):
+        self.grab_count += 1
+        return self.frame
+
+
+def _workspace():
+    return Workspace(
+        min_corner=np.array([-1.0, -2.0, 0.0], dtype=np.float32),
+        max_corner=np.array([1.0, 2.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_dashboard_snapshot_contains_model_workspace_robot_and_unaligned_xr():
+    async def run():
+        hub = TelemetryHub(
+            point_cloud_source=CountingPointCloud(),
+            robot_driver=FakeRobot(),
+            workspace=_workspace(),
+            urdf_url="/robot/robot.urdf",
+            urdf_assets_url="/robot/assets/",
+            pointcloud_hz=1000.0,
+            robot_hz=1000.0,
+            status_hz=1000.0,
+        )
+        await hub.sample_robot_once()
+
+        snap = hub.snapshot()
+
+        assert snap["type"] == "snapshot"
+        assert snap["model"]["urdf_url"] == "/robot/robot.urdf"
+        assert snap["model"]["urdf_assets_url"] == "/robot/assets/"
+        assert snap["workspace"]["min"] == [-1.0, -2.0, 0.0]
+        assert snap["workspace"]["max"] == [1.0, 2.0, 1.0]
+        assert snap["robot"]["joints"] == {
+            "joint0": 0.4000000059604645,
+            "right_index_pip": -0.20000000298023224,
+        }
+        assert snap["xr"]["aligned"] is False
+        assert snap["xr"]["head"] is None
+        assert snap["xr"]["right_wrist"] is None
+
+    asyncio.run(run())
+
+
+def test_dashboard_xr_pose_stays_unaligned_until_anchor_exists():
+    hub = TelemetryHub(
+        point_cloud_source=CountingPointCloud(),
+        robot_driver=FakeRobot(),
+        workspace=_workspace(),
+        urdf_url="/robot/robot.urdf",
+        urdf_assets_url="/robot/assets/",
+    )
+    hub.update_xr_pose(
+        head_position=(0.0, 1.6, 0.0),
+        head_orientation=(0.0, 0.0, 0.0, 1.0),
+        right_wrist_position=(0.2, 1.1, -0.3),
+        right_wrist_orientation=(0.0, 0.0, 0.0, 1.0),
+        valid=True,
+        timestamp=10.0,
+    )
+    assert hub.snapshot()["xr"]["aligned"] is False
+
+    hub.update_anchor((0.1, 1.0, -0.2), timestamp=11.0)
+    snap = hub.snapshot()
+
+    assert snap["xr"]["aligned"] is True
+    assert snap["xr"]["head"]["position"] == [0.0, 1.6, 0.0]
+    assert snap["xr"]["right_wrist"]["position"] == [0.2, 1.1, -0.3]
+
+
+def test_multiple_dashboard_cloud_waiters_share_one_grab():
+    async def run():
+        pc = CountingPointCloud()
+        hub = TelemetryHub(
+            point_cloud_source=pc,
+            robot_driver=FakeRobot(),
+            workspace=_workspace(),
+            urdf_url="/robot/robot.urdf",
+            urdf_assets_url="/robot/assets/",
+        )
+
+        await hub.sample_pointcloud_once()
+        first = await hub.wait_for_pointcloud(after_sequence=0, timeout=0.01)
+        second = await hub.wait_for_pointcloud(after_sequence=0, timeout=0.01)
+
+        assert first is not None
+        assert second is not None
+        assert first.sequence == second.sequence == 1
+        assert first.payload == second.payload
+        assert pc.grab_count == 1
+
+    asyncio.run(run())
+
+
+def test_dashboard_robot_snapshot_omits_joints_when_driver_has_no_names():
+    async def run():
+        robot = FakeRobot()
+        robot.state = RobotState(
+            wrist_pose=Pose.identity(frame="world"),
+            joint_angles=np.zeros(6, dtype=np.float32),
+            finger_curls=np.zeros(5, dtype=np.float32),
+            timestamp=42.0,
+        )
+        hub = TelemetryHub(
+            point_cloud_source=CountingPointCloud(),
+            robot_driver=robot,
+            workspace=_workspace(),
+            urdf_url="/robot/robot.urdf",
+            urdf_assets_url="/robot/assets/",
+        )
+        await hub.sample_robot_once()
+        assert hub.snapshot()["robot"]["joints"] == {}
+
+    asyncio.run(run())
+
+
+def test_resolve_robot_asset_path_allows_assets_under_root(tmp_path):
+    root = tmp_path / "robot"
+    mesh_dir = root / "meshes"
+    mesh_dir.mkdir(parents=True)
+    mesh = mesh_dir / "link.stl"
+    mesh.write_text("mesh")
+
+    assert _resolve_robot_asset_path(root, "meshes/link.stl") == mesh.resolve()
+
+
+def test_resolve_robot_asset_path_rejects_path_escape(tmp_path):
+    root = tmp_path / "robot"
+    root.mkdir()
+    outside = tmp_path / "secret.stl"
+    outside.write_text("secret")
+
+    with pytest.raises(ValueError):
+        _resolve_robot_asset_path(root, "../secret.stl")

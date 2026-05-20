@@ -1,9 +1,6 @@
 """Robot driver backends."""
 
 from .noop import NoopRobotDriver
-from .pybullet_driver import PybulletRobotDriver
-from .floating_wrist_driver import FloatingWristDriver
-from .aero_arm import AeroArmDriver
 
 __all__ = [
     "NoopRobotDriver",
@@ -11,3 +8,16 @@ __all__ = [
     "FloatingWristDriver",
     "AeroArmDriver",
 ]
+
+
+def __getattr__(name: str):
+    if name == "PybulletRobotDriver":
+        from .pybullet_driver import PybulletRobotDriver
+        return PybulletRobotDriver
+    if name == "FloatingWristDriver":
+        from .floating_wrist_driver import FloatingWristDriver
+        return FloatingWristDriver
+    if name == "AeroArmDriver":
+        from .aero_arm import AeroArmDriver
+        return AeroArmDriver
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
