@@ -28,12 +28,15 @@ from teleop_backends.camera_calibration import (
     CharucoBoardSpec,
     JointStateProvider,
     RealSenseColorFeed,
-    UnavailableJointStateProvider,
     UrdfKinematicTree,
     ZedColorFeed,
     build_hardware_camera_config,
     estimate_two_camera_extrinsics,
     transform_from_rt,
+)
+from teleop_backends.robot.rc5_state import (
+    RC5_ARM_JOINT_NAMES,
+    RC5JointStateReader,
 )
 
 
@@ -58,6 +61,10 @@ class JsonJointStateProvider(JointStateProvider):
         return {str(name): float(value) for name, value in data.items()}
 
 
+def _default_urdf() -> Path:
+    return REPO_ROOT / "urdf_rc5_right_hand" / "urdf_with_simple_collisions.urdf"
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
 
@@ -73,14 +80,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--zed-resolution", default="HD720")
 
-    ap.add_argument("--urdf", type=Path, required=True)
-    ap.add_argument("--base-link", required=True)
-    ap.add_argument("--camera-link", required=True)
+    ap.add_argument("--urdf", type=Path, default=_default_urdf())
+    ap.add_argument("--base-link", default="world")
+    ap.add_argument("--camera-link", default="d405_depth_optical_frame")
+    ap.add_argument("--arm-ip", default="10.10.10.10")
+    ap.add_argument("--rc5-api-path", type=Path, default=None)
     ap.add_argument(
         "--joint-state-json",
         type=Path,
         default=None,
-        help="temporary fixed-pose joint snapshot; omit when the live SDK provider is wired",
+        help="offline fixed-pose joint snapshot; omit to read the live RC5 joints",
     )
 
     ap.add_argument("--squares-x", type=int, required=True)
@@ -114,6 +123,7 @@ def run_interactive_calibration(args: argparse.Namespace) -> None:
 
     joint_provider = _make_joint_state_provider(args)
     joint_state = joint_provider.read_joint_state()
+    _print_fk_inputs(args, joint_state)
     world_from_arm_camera = UrdfKinematicTree.from_file(args.urdf).transform(
         args.base_link,
         args.camera_link,
@@ -245,10 +255,28 @@ def run_interactive_calibration(args: argparse.Namespace) -> None:
 def _make_joint_state_provider(args: argparse.Namespace) -> JointStateProvider:
     if args.joint_state_json is not None:
         return JsonJointStateProvider(args.joint_state_json)
-    return UnavailableJointStateProvider(
-        "live robot joint-state SDK adapter is not implemented yet; "
-        "provide --joint-state-json for a fixed-pose snapshot or wire the SDK provider"
+    return RC5JointStateReader(
+        arm_ip=args.arm_ip,
+        rc5_api_path=args.rc5_api_path,
     )
+
+
+def _print_fk_inputs(args: argparse.Namespace, joint_state: dict[str, float]) -> None:
+    print(f"[calib] URDF: {Path(args.urdf).resolve()}")
+    print(f"[calib] FK chain: {args.base_link} -> {args.camera_link}")
+    ordered_names = [
+        name for name in RC5_ARM_JOINT_NAMES
+        if name in joint_state
+    ]
+    ordered_names.extend(
+        name for name in sorted(joint_state)
+        if name not in ordered_names
+    )
+    joints = ", ".join(
+        f"{name}={joint_state[name]:.6f}"
+        for name in ordered_names
+    )
+    print(f"[calib] arm joints rad: {joints}")
 
 
 def _make_feed(

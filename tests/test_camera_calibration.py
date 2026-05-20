@@ -1,6 +1,7 @@
 import importlib
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -179,6 +180,24 @@ def test_urdf_fk_computes_base_to_camera_link(tmp_path):
         rotation_matrix_from_axis_angle([0, 0, 1], math.pi / 2),
         atol=1e-6,
     )
+
+
+def test_canonical_urdf_resolves_world_to_d405_depth_optical_frame():
+    urdf = (
+        Path(__file__).resolve().parents[1]
+        / "urdf_rc5_right_hand"
+        / "urdf_with_simple_collisions.urdf"
+    )
+
+    tree = UrdfKinematicTree.from_file(urdf)
+    base_from_camera = tree.transform(
+        "world",
+        "d405_depth_optical_frame",
+        {f"joint{i}": 0.0 for i in range(6)},
+    )
+
+    assert base_from_camera.shape == (4, 4)
+    assert np.all(np.isfinite(base_from_camera))
 
 
 def test_missing_camera_sdks_are_reported_only_when_feeds_start(monkeypatch):
