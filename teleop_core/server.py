@@ -173,6 +173,10 @@ class TeleopServer:
         app = web.Application()
         app.router.add_get("/ws", self._handle_dashboard_ws)
         app.router.add_get("/api/snapshot", self._handle_dashboard_snapshot)
+        app.router.add_get(
+            "/api/cameras/{name}/color.jpg",
+            self._handle_dashboard_camera_color,
+        )
         app.router.add_get("/robot/robot.urdf", self._handle_robot_urdf)
         app.router.add_get("/robot/assets/{tail:.*}", self._handle_robot_asset)
         app.router.add_get(
@@ -184,6 +188,19 @@ class TeleopServer:
 
     async def _handle_dashboard_snapshot(self, _request) -> web.Response:
         return web.json_response(self._telemetry.snapshot())
+
+    async def _handle_dashboard_camera_color(self, request) -> web.Response:
+        latest_color_jpeg = getattr(self._pc, "latest_color_jpeg", None)
+        if not callable(latest_color_jpeg):
+            return web.Response(status=404, text="camera feed unavailable")
+        image = latest_color_jpeg(request.match_info["name"])
+        if image is None:
+            return web.Response(status=404, text="camera frame not ready")
+        return web.Response(
+            body=image,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _handle_robot_urdf(self, _request) -> web.StreamResponse:
         if self._config.urdf_path is None:
@@ -311,9 +328,10 @@ class TeleopServer:
                         head_orientation=decoded.head_orientation,
                         right_wrist_position=decoded.wrist_position,
                         right_wrist_orientation=decoded.wrist_orientation,
-                        valid=decoded.head_valid and decoded.valid,
+                        valid=decoded.valid,
                         timestamp=time.monotonic(),
                         right_wrist_curls=decoded.curls,
+                        head_valid=decoded.head_valid,
                     )
                 elif isinstance(decoded, ButtonMsg):
                     await self._on_button(ws, decoded)

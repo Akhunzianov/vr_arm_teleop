@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import quote
 
 import numpy as np
 
@@ -33,6 +34,7 @@ class HardwareCameraConfig:
     serial: str | None
     world_from_camera: np.ndarray
     calibrated: bool
+    urdf_link: str | None = None
     width: int = 640
     height: int = 480
     fps: int = 30
@@ -74,6 +76,10 @@ class CameraPointCloudReader(abc.ABC):
     @abc.abstractmethod
     async def grab_camera_frame(self) -> Optional[PointCloudFrame]:
         """Return a point cloud in that camera's local frame."""
+
+    def latest_color_jpeg(self) -> bytes | None:
+        """Return the latest RGB color frame encoded as JPEG, if available."""
+        return None
 
 
 ReaderFactory = Callable[[HardwareCameraConfig], CameraPointCloudReader]
@@ -153,6 +159,9 @@ def _parse_camera(raw: dict, index: int) -> HardwareCameraConfig:
         serial=serial,
         world_from_camera=world_from_camera,
         calibrated=calibrated,
+        urdf_link=(
+            None if raw.get("urdf_link") is None else str(raw.get("urdf_link"))
+        ),
         width=int(raw.get("width", 640)),
         height=int(raw.get("height", 480)),
         fps=int(raw.get("fps", 30)),
@@ -239,6 +248,25 @@ def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (homogeneous @ transform.T)[:, :3]
 
 
+def _encode_rgb_jpeg(image: np.ndarray) -> bytes | None:
+    try:
+        cv2 = importlib.import_module("cv2")
+    except ModuleNotFoundError:
+        return None
+    rgb = np.asarray(image, dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return None
+    bgr = np.ascontiguousarray(rgb[:, :, :3][:, :, ::-1])
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+    )
+    if not ok:
+        return None
+    return encoded.tobytes()
+
+
 class HardwarePointCloudSource(PointCloudSource):
     """Fuses configured RealSense and ZED 2i readers into one cloud."""
 
@@ -264,6 +292,27 @@ class HardwarePointCloudSource(PointCloudSource):
     @property
     def display_enabled(self) -> bool:
         return self._config.display_calibrated
+
+    def dashboard_camera_feeds(self) -> list[dict[str, object]]:
+        """Describe color feeds that the dashboard can attach to URDF links."""
+        feeds: list[dict[str, object]] = []
+        for camera in self._config.cameras:
+            if not camera.urdf_link:
+                continue
+            feeds.append({
+                "name": camera.name,
+                "urdf_link": camera.urdf_link,
+                "url": f"/api/cameras/{quote(camera.name, safe='')}/color.jpg",
+                "width": int(camera.width),
+                "height": int(camera.height),
+            })
+        return feeds
+
+    def latest_color_jpeg(self, camera_name: str) -> bytes | None:
+        for camera, reader in self._readers:
+            if camera.name == camera_name:
+                return reader.latest_color_jpeg()
+        return None
 
     async def start(self) -> None:
         if self._started:
@@ -333,6 +382,7 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         self._pipeline = None
         self._align = None
         self._pointcloud = None
+        self._latest_color_jpeg: bytes | None = None
 
     async def start(self) -> None:
         try:
@@ -393,6 +443,7 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         points_obj = self._pointcloud.calculate(depth)
         vertices = np.asanyarray(points_obj.get_vertices()).view(np.float32).reshape(-1, 3)
         color_image = np.asanyarray(color.get_data())
+        self._latest_color_jpeg = _encode_rgb_jpeg(color_image)
         colors = color_image.reshape(-1, 3)
 
         points, colors = _filter_camera_points(
@@ -407,6 +458,9 @@ class RealSensePointCloudReader(CameraPointCloudReader):
             colors=colors,
             timestamp=time.monotonic(),
         )
+
+    def latest_color_jpeg(self) -> bytes | None:
+        return self._latest_color_jpeg
 
 
 class Zed2iPointCloudReader(CameraPointCloudReader):
