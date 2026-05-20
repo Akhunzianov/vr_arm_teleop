@@ -66,13 +66,19 @@ DEFAULT_STEPS: tuple[CalibStep, ...] = (
                "Press X to confirm.",
         kind=CalibStepKind.CURL, bound=CalibBound.MIN, fingers=(0,),
     ),
+    # Bounds are swapped relative to anatomical labels: the URDF's
+    # right_thumb_cmc_abd joint goes (lower = thumb spread/up, upper =
+    # tucked across palm), opposite of what "abduction min/max" suggests.
+    # Keep the prompt text natural and store the captured raw values so
+    # the linear remap in CalibrationRecord.apply_abduction sends the
+    # joint to the right end.
     CalibStep(
-        prompt="Tuck thumb in alongside the index finger (abduction min).\n"
+        prompt="Spread thumb fully away from the palm.\n"
                "Press X to confirm.",
         kind=CalibStepKind.ABDUCTION, bound=CalibBound.MIN,
     ),
     CalibStep(
-        prompt="Spread thumb fully away from the palm (abduction max).\n"
+        prompt="Tuck thumb in alongside the index finger.\n"
                "Press X to confirm.",
         kind=CalibStepKind.ABDUCTION, bound=CalibBound.MAX,
     ),

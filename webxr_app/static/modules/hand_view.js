@@ -47,6 +47,21 @@ const JOINT_NEXT = {
   20: 21, 21: 22, 22: 23, 23: 24,
 };
 
+// Map a driven joint index to the finger it belongs to (0=thumb..4=pinky).
+// Used by the curl-based bend path (driveCurls) below.
+const JOINT_TO_FINGER_IDX = {
+  2: 0, 3: 0, 4: 0,
+  6: 1, 7: 1, 8: 1,
+  11: 2, 12: 2, 13: 2,
+  16: 3, 17: 3, 18: 3,
+  20: 4, 21: 4, 22: 4, 23: 4,
+};
+
+// Per-segment bend at full curl. Distal segments bend more than proximal
+// in reality, but a single value reads fine for the alignment-hint use
+// case; tune later if needed.
+const SEGMENT_CURL_MAX_RAD = (Math.PI / 180) * 70;
+
 const _tmpParentInv = new THREE.Matrix4();
 const _tmpDir       = new THREE.Vector3();
 const _tmpQ         = new THREE.Quaternion();
@@ -61,7 +76,15 @@ export class HandView {
     // around the wrist's vertical (palm-normal) axis. 180°X (palm flip) made
     // it appear mirrored; identity left the wrist pointing away.
     offsetQuaternion = [0, 1, 0, 0],
+    // When set, every mesh in the FBX is replaced with a flat-coloured
+    // material (no texture). Used for the "ghost" hand that marks the
+    // re-engage pose -- distinct colour + translucency makes it obvious.
+    color = null,
+    opacity = 1.0,
+    debugJointDots = true,
   } = {}) {
+    this._forceColor = color;
+    this._forceOpacity = opacity;
     this._group = new THREE.Group();
     this._group.visible = false;
     scene.add(this._group);
@@ -69,18 +92,20 @@ export class HandView {
     // DEBUG: 25 cyan spheres parented to the world scene, one per WebXR
     // joint, drawn at the raw positions reported by the headset. Useful
     // for sanity-checking that the rig orientation matches reality.
-    // Remove once the hand rendering is dialed in.
+    // Skipped for the ghost hand so it doesn't double up with the live one.
     this._debugDots = [];
-    const dotGeo = new THREE.SphereGeometry(0.006, 8, 8);
-    const dotMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
-    for (let i = 0; i < 25; i++) {
-      const m = new THREE.Mesh(dotGeo, dotMat);
-      m.visible = false;
-      scene.add(m);
-      this._debugDots.push(m);
+    if (debugJointDots) {
+      const dotGeo = new THREE.SphereGeometry(0.006, 8, 8);
+      const dotMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+      for (let i = 0; i < 25; i++) {
+        const m = new THREE.Mesh(dotGeo, dotMat);
+        m.visible = false;
+        scene.add(m);
+        this._debugDots.push(m);
+      }
+      // Highlight the wrist (joint 0) so we can see which end is which.
+      this._debugDots[0].material = new THREE.MeshBasicMaterial({ color: 0xff00ff });
     }
-    // Highlight the wrist (joint 0) so we can see which end is which.
-    this._debugDots[0].material = new THREE.MeshBasicMaterial({ color: 0xff00ff });
 
     this._inner = new THREE.Group();
     this._inner.position.set(...offsetPosition);
@@ -94,6 +119,19 @@ export class HandView {
     new FBXLoader().load(url, (root) => {
       root.traverse((c) => {
         if (!c.isMesh) return;
+        if (this._forceColor != null) {
+          // Ghost-hand path: force a flat coloured (and optionally
+          // translucent) material regardless of what the FBX shipped with.
+          c.material = new THREE.MeshStandardMaterial({
+            color: this._forceColor,
+            roughness: 0.6,
+            metalness: 0.0,
+            transparent: this._forceOpacity < 1.0,
+            opacity: this._forceOpacity,
+            depthWrite: this._forceOpacity >= 1.0,
+          });
+          return;
+        }
         const m = Array.isArray(c.material) ? c.material[0] : c.material;
         if (!m || m.map == null) {
           c.material = new THREE.MeshStandardMaterial({
@@ -233,5 +271,46 @@ export class HandView {
   setOffset(position, quaternion) {
     if (position) this._inner.position.set(...position);
     if (quaternion) this._inner.quaternion.set(...quaternion);
+  }
+
+  setVisible(v) {
+    this._group.visible = !!v;
+    if (!v) for (const d of this._debugDots) d.visible = false;
+  }
+
+  // Bend finger bones from a 5-vector of normalized curl values
+  // (thumb..pinky, 0..1). Used by the ghost hand to mirror the robot's
+  // current finger state when we don't have full per-joint positions.
+  //
+  // For each bone we rotate the rest direction around a heuristic bend
+  // axis (perpendicular to the bone's long axis, biased toward the palm
+  // normal in the parent frame) and apply the resulting alignment quat
+  // on top of the bone's rest local rotation -- same shape as the
+  // position-driven path in _driveBones.
+  driveCurls(curls) {
+    if (!curls) return;
+    const indices = Object.keys(this._bones).map(Number).sort((a, b) => a - b);
+    const _palmGuess = new THREE.Vector3(0, 1, 0);   // parent-local heuristic
+    const _bendAxis = new THREE.Vector3();
+    const _desired = new THREE.Vector3();
+    const _qBend = new THREE.Quaternion();
+    const _qAlign = new THREE.Quaternion();
+    for (const j of indices) {
+      const info = this._bones[j];
+      if (!info.restParentDir) continue;
+      const fingerIdx = JOINT_TO_FINGER_IDX[j];
+      if (fingerIdx == null) continue;
+      const c = Math.max(0, Math.min(1, curls[fingerIdx] ?? 0));
+      const angle = c * SEGMENT_CURL_MAX_RAD;
+      _bendAxis.crossVectors(info.restParentDir, _palmGuess);
+      if (_bendAxis.lengthSq() < 1e-8) _bendAxis.set(0, 0, 1);
+      _bendAxis.normalize();
+      _qBend.setFromAxisAngle(_bendAxis, angle);
+      _desired.copy(info.restParentDir).applyQuaternion(_qBend);
+      _qAlign.setFromUnitVectors(info.restParentDir, _desired);
+      info.bone.quaternion.copy(_qAlign).multiply(info.restLocalQ);
+      info.bone.updateMatrix();
+      info.bone.updateMatrixWorld(true);
+    }
   }
 }

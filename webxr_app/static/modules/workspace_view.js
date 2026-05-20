@@ -29,9 +29,20 @@ export class WorkspaceView {
     this._lines.visible = false;
     scene.add(this._lines);
 
-    this._center = new THREE.Vector3();  // box center in robot-world coords
+    this._center = new THREE.Vector3();  // box center in helmet coords (rel. origin)
+    this._half = new THREE.Vector3();    // box half-extents in helmet coords
     this._origin = null;                 // robot-world origin in VR coords
     this._haveBounds = false;
+  }
+
+  // True iff `point` (VR/helmet world coords) lies inside the workspace box.
+  // Returns null when we don't yet have both bounds and the anchor.
+  containsPoint(point) {
+    if (!this._haveBounds || this._origin === null || !point) return null;
+    const dx = Math.abs(point[0] - (this._origin.x + this._center.x));
+    const dy = Math.abs(point[1] - (this._origin.y + this._center.y));
+    const dz = Math.abs(point[2] - (this._origin.z + this._center.z));
+    return dx <= this._half.x && dy <= this._half.y && dz <= this._half.z;
   }
 
   setBounds(min, max) {
@@ -49,6 +60,11 @@ export class WorkspaceView {
       (minXh + maxXh) * 0.5,
       (minYh + maxYh) * 0.5,
       (minZh + maxZh) * 0.5,
+    );
+    this._half.set(
+      (maxXh - minXh) * 0.5,
+      (maxYh - minYh) * 0.5,
+      (maxZh - minZh) * 0.5,
     );
     this._lines.scale.set(maxXh - minXh, maxYh - minYh, maxZh - minZh);
     this._haveBounds = true;
