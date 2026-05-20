@@ -43,6 +43,15 @@ export class PointCloudView {
     scene.add(this._points);
   }
 
+  setVisible(v) {
+    this._points.visible = !!v;
+  }
+
+  toggleVisible() {
+    this._points.visible = !this._points.visible;
+    return this._points.visible;
+  }
+
   ingest(arrayBuffer) {
     const view = new DataView(arrayBuffer);
     const n = view.getUint32(0, true);
