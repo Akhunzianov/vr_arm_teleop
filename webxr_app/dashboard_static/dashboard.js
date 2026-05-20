@@ -5,12 +5,14 @@ import { DashboardPointCloudView } from './modules/dashboard_pointcloud_view.js'
 import { WorkspaceLayer } from './modules/workspace_layer.js';
 import { XRMarkers } from './modules/xr_markers.js';
 import { StatusPanel } from './modules/status_panel.js';
+import { CalibrationView } from './modules/calibration_view.js';
 
 const scene = new DashboardScene(document.getElementById('viewport'));
 const robot = new RobotView(scene.world);
 const cloud = new DashboardPointCloudView(scene.world);
 const workspace = new WorkspaceLayer(scene.world);
 const xr = new XRMarkers(scene.world);
+const calibration = new CalibrationView(scene.world);
 const status = new StatusPanel(
   document.getElementById('status'),
   document.getElementById('connection'),
@@ -24,6 +26,10 @@ comms.onJson = msg => {
   if (msg.type !== 'snapshot') return;
   if (!modelLoaded) {
     robot.load(msg.model, () => {
+      if (msg.model && msg.model.pointcloud_frame === 'world') {
+        cloud.setLinkParent(null);
+        return;
+      }
       // Parent the cloud to the first camera with a URDF link (the wrist
       // D405). When the arm moves, the cloud moves with it.
       const feeds = (msg.model && msg.model.camera_feeds) || [];
@@ -39,6 +45,7 @@ comms.onJson = msg => {
   }
   robot.applyJoints(msg.robot.joints);
   xr.update(msg.xr);
+  calibration.update(msg.calibration);
   status.update(msg);
 };
 comms.onBinary = buf => cloud.ingest(buf);
@@ -54,3 +61,4 @@ bindToggle('toggle-robot', robot);
 bindToggle('toggle-cloud', cloud);
 bindToggle('toggle-workspace', workspace);
 bindToggle('toggle-xr', xr);
+bindToggle('toggle-calibration', calibration);

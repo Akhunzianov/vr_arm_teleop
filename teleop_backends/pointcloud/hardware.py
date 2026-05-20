@@ -20,6 +20,7 @@ from urllib.parse import quote
 import numpy as np
 
 from teleop_core.point_cloud import PointCloudFrame, PointCloudSource
+from teleop_backends.camera_calibration import CameraDescriptor
 
 
 SUPPORTED_CAMERA_TYPES = {"realsense", "zed2i"}
@@ -79,6 +80,14 @@ class CameraPointCloudReader(abc.ABC):
 
     def latest_color_jpeg(self) -> bytes | None:
         """Return the latest RGB color frame encoded as JPEG, if available."""
+        return None
+
+    def latest_color_rgb(self) -> np.ndarray | None:
+        """Return the latest RGB color frame, if available."""
+        return None
+
+    def descriptor(self) -> CameraDescriptor | None:
+        """Return camera intrinsics when the backend SDK exposes them."""
         return None
 
 
@@ -380,9 +389,11 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         self._camera = camera
         self._rs = None
         self._pipeline = None
+        self._profile = None
         self._align = None
         self._pointcloud = None
         self._latest_color_jpeg: bytes | None = None
+        self._latest_color_rgb: np.ndarray | None = None
 
     async def start(self) -> None:
         try:
@@ -413,7 +424,7 @@ class RealSensePointCloudReader(CameraPointCloudReader):
             rs.format.rgb8,
             self._camera.fps,
         )
-        pipeline.start(config)
+        self._profile = pipeline.start(config)
         self._rs = rs
         self._pipeline = pipeline
         self._align = rs.align(rs.stream.color)
@@ -422,6 +433,7 @@ class RealSensePointCloudReader(CameraPointCloudReader):
     async def stop(self) -> None:
         pipeline = self._pipeline
         self._pipeline = None
+        self._profile = None
         if pipeline is not None:
             await asyncio.to_thread(pipeline.stop)
 
@@ -443,6 +455,7 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         points_obj = self._pointcloud.calculate(depth)
         vertices = np.asanyarray(points_obj.get_vertices()).view(np.float32).reshape(-1, 3)
         color_image = np.asanyarray(color.get_data())
+        self._latest_color_rgb = color_image.copy()
         self._latest_color_jpeg = _encode_rgb_jpeg(color_image)
         colors = color_image.reshape(-1, 3)
 
@@ -462,6 +475,29 @@ class RealSensePointCloudReader(CameraPointCloudReader):
     def latest_color_jpeg(self) -> bytes | None:
         return self._latest_color_jpeg
 
+    def latest_color_rgb(self) -> np.ndarray | None:
+        return None if self._latest_color_rgb is None else self._latest_color_rgb.copy()
+
+    def descriptor(self) -> CameraDescriptor | None:
+        if self._profile is None or self._rs is None:
+            return None
+        stream = self._profile.get_stream(self._rs.stream.color)
+        intr = stream.as_video_stream_profile().get_intrinsics()
+        return CameraDescriptor(
+            name=self._camera.name,
+            camera_type="realsense",
+            serial=self._camera.serial,
+            width=self._camera.width,
+            height=self._camera.height,
+            fps=self._camera.fps,
+            camera_matrix=[
+                [float(intr.fx), 0.0, float(intr.ppx)],
+                [0.0, float(intr.fy), float(intr.ppy)],
+                [0.0, 0.0, 1.0],
+            ],
+            distortion=[float(v) for v in getattr(intr, "coeffs", [])],
+        )
+
 
 class Zed2iPointCloudReader(CameraPointCloudReader):
     """Reader for one Stereolabs ZED 2i camera."""
@@ -471,6 +507,9 @@ class Zed2iPointCloudReader(CameraPointCloudReader):
         self._sl = None
         self._zed = None
         self._mat = None
+        self._image_mat = None
+        self._latest_color_rgb: np.ndarray | None = None
+        self._latest_color_jpeg: bytes | None = None
 
     async def start(self) -> None:
         try:
@@ -498,6 +537,7 @@ class Zed2iPointCloudReader(CameraPointCloudReader):
         self._sl = sl
         self._zed = zed
         self._mat = sl.Mat()
+        self._image_mat = sl.Mat()
 
     async def stop(self) -> None:
         zed = self._zed
@@ -515,6 +555,12 @@ class Zed2iPointCloudReader(CameraPointCloudReader):
         status = self._zed.grab(runtime)
         if status != self._sl.ERROR_CODE.SUCCESS:
             return None
+        if self._image_mat is not None:
+            self._zed.retrieve_image(self._image_mat, self._sl.VIEW.LEFT)
+            image = np.asarray(self._image_mat.get_data())
+            if image.ndim == 3 and image.shape[2] >= 3:
+                self._latest_color_rgb = image[:, :, 2::-1].copy()
+                self._latest_color_jpeg = _encode_rgb_jpeg(self._latest_color_rgb)
         self._zed.retrieve_measure(self._mat, self._sl.MEASURE.XYZRGBA)
         data = np.asarray(self._mat.get_data())
         flat = data.reshape(-1, data.shape[-1])
@@ -531,6 +577,36 @@ class Zed2iPointCloudReader(CameraPointCloudReader):
             points=points,
             colors=colors,
             timestamp=time.monotonic(),
+        )
+
+    def latest_color_jpeg(self) -> bytes | None:
+        return self._latest_color_jpeg
+
+    def latest_color_rgb(self) -> np.ndarray | None:
+        return None if self._latest_color_rgb is None else self._latest_color_rgb.copy()
+
+    def descriptor(self) -> CameraDescriptor | None:
+        if self._zed is None:
+            return None
+        info = self._zed.get_camera_information()
+        calib = info.camera_configuration.calibration_parameters.left_cam
+        width = int(getattr(calib, "image_size", (0, 0))[0] or self._camera.width)
+        height = int(getattr(calib, "image_size", (0, 0))[1] or self._camera.height)
+        return CameraDescriptor(
+            name=self._camera.name,
+            camera_type="zed2i",
+            serial=self._camera.serial,
+            width=width,
+            height=height,
+            fps=self._camera.fps,
+            camera_matrix=[
+                [float(calib.fx), 0.0, float(calib.cx)],
+                [0.0, float(calib.fy), float(calib.cy)],
+                [0.0, 0.0, 1.0],
+            ],
+            distortion=[float(v) for v in getattr(calib, "disto", [])],
+            resolution=self._camera.resolution,
+            depth_mode=self._camera.depth_mode,
         )
 
 

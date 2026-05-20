@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from teleop_backends.camera_calibration import (
+    AnchoredExtrinsicOptimizer,
     CameraDescriptor,
     CalibrationObservation,
+    CalibrationDetection,
     CharucoBoardSpec,
     RealSenseColorFeed,
     UnavailableJointStateProvider,
@@ -18,7 +20,9 @@ from teleop_backends.camera_calibration import (
     estimate_two_camera_extrinsics,
     invert_transform,
     rotation_matrix_from_axis_angle,
+    select_anchor_camera,
     transform_from_rt,
+    write_calibrated_hardware_config,
 )
 from teleop_backends.pointcloud.hardware import load_hardware_config
 
@@ -222,3 +226,180 @@ def test_placeholder_joint_state_provider_fails_loudly():
 
     with pytest.raises(RuntimeError, match="future arm SDK"):
         provider.read_joint_state()
+
+
+def test_select_anchor_camera_defaults_to_camera_link(tmp_path):
+    config_path = tmp_path / "cameras.json"
+    config_path.write_text(json.dumps({
+        "cameras": [
+            {
+                "name": "d405",
+                "type": "realsense",
+                "serial": "anchor",
+                "urdf_link": "d405_depth_optical_frame",
+                "calibrated": False,
+            },
+            {
+                "name": "d435i",
+                "type": "realsense",
+                "serial": "target",
+                "calibrated": False,
+            },
+        ]
+    }))
+    config = load_hardware_config(config_path)
+
+    anchor = select_anchor_camera(
+        config,
+        anchor_name=None,
+        camera_link="d405_depth_optical_frame",
+    )
+
+    assert anchor.name == "d405"
+
+
+def test_select_anchor_camera_can_use_explicit_name(tmp_path):
+    config_path = tmp_path / "cameras.json"
+    config_path.write_text(json.dumps({
+        "cameras": [
+            {"name": "d405", "type": "realsense", "serial": "anchor"},
+            {"name": "zed-overhead", "type": "zed2i", "serial": "123"},
+        ]
+    }))
+    config = load_hardware_config(config_path)
+
+    anchor = select_anchor_camera(
+        config,
+        anchor_name="zed-overhead",
+        camera_link="d405_depth_optical_frame",
+    )
+
+    assert anchor.name == "zed-overhead"
+
+
+def _detection(camera_from_board, reprojection=0.2, corners=24):
+    return CalibrationDetection(
+        camera_from_board=camera_from_board,
+        reprojection_error=reprojection,
+        corner_count=corners,
+    )
+
+
+def test_anchored_optimizer_uses_live_fk_to_keep_external_camera_world_pose_stable():
+    world_from_external = transform_from_rt(
+        rotation_matrix_from_axis_angle([0, 1, 0], -0.2),
+        [0.45, -0.1, 0.7],
+    )
+    optimizer = AnchoredExtrinsicOptimizer(
+        anchor_name="d405",
+        target_names=("d435i",),
+        min_samples=5,
+        rolling_window=8,
+        min_corners=12,
+        max_reprojection_error_px=1.0,
+        stability_seconds=0.0,
+    )
+
+    for i in range(6):
+        world_from_anchor = transform_from_rt(
+            rotation_matrix_from_axis_angle([0, 0, 1], 0.03 * i),
+            [0.1 + 0.01 * i, 0.02 * i, 0.4],
+        )
+        world_from_board = transform_from_rt(
+            rotation_matrix_from_axis_angle([1, 0.2, 0.1], 0.04 * i),
+            [0.25 + 0.01 * i, -0.05, 0.85 + 0.02 * i],
+        )
+        optimizer.add_frame(
+            world_from_anchor_camera=world_from_anchor,
+            detections={
+                "d405": _detection(invert_transform(world_from_anchor) @ world_from_board),
+                "d435i": _detection(invert_transform(world_from_external) @ world_from_board),
+            },
+            timestamp=float(i),
+        )
+
+    status = optimizer.status()["targets"]["d435i"]
+
+    assert status["stable"] is True
+    assert status["accepted_samples"] >= 5
+    assert np.allclose(status["world_from_camera"], world_from_external, atol=1e-6)
+
+
+def test_anchored_optimizer_rejects_bad_detections_and_requires_all_targets_stable():
+    world_from_anchor = np.eye(4)
+    world_from_target = transform_from_rt(np.eye(3), [0.2, 0.0, 0.0])
+    world_from_board = transform_from_rt(np.eye(3), [0.1, 0.0, 0.7])
+    optimizer = AnchoredExtrinsicOptimizer(
+        anchor_name="d405",
+        target_names=("d435i", "zed-overhead"),
+        min_samples=3,
+        rolling_window=4,
+        min_corners=12,
+        max_reprojection_error_px=1.0,
+        stability_seconds=0.0,
+    )
+
+    for i in range(3):
+        optimizer.add_frame(
+            world_from_anchor_camera=world_from_anchor,
+            detections={
+                "d405": _detection(world_from_board),
+                "d435i": _detection(invert_transform(world_from_target) @ world_from_board),
+                "zed-overhead": _detection(
+                    invert_transform(world_from_target) @ world_from_board,
+                    reprojection=4.0,
+                ),
+            },
+            timestamp=float(i),
+        )
+
+    status = optimizer.status()
+
+    assert status["targets"]["d435i"]["stable"] is True
+    assert status["targets"]["zed-overhead"]["stable"] is False
+    assert status["targets"]["zed-overhead"]["rejected_samples"] == 3
+    assert status["all_stable"] is False
+
+
+def test_write_calibrated_hardware_config_preserves_fields_and_creates_backup(tmp_path):
+    config_path = tmp_path / "hardware_cameras.json"
+    original = {
+        "workspace_crop": {"min": [0, 0, 0], "max": [1, 1, 1]},
+        "max_points": 5000,
+        "cameras": [
+            {
+                "name": "d405",
+                "type": "realsense",
+                "serial": "anchor",
+                "urdf_link": "d405_depth_optical_frame",
+                "enabled": True,
+                "calibrated": False,
+            },
+            {
+                "name": "disabled",
+                "type": "realsense",
+                "serial": "disabled",
+                "enabled": False,
+                "calibrated": False,
+            },
+        ],
+    }
+    config_path.write_text(json.dumps(original, indent=2))
+    world_from_d405 = transform_from_rt(np.eye(3), [0.1, 0.2, 0.3])
+
+    result = write_calibrated_hardware_config(
+        config_path,
+        {"d405": world_from_d405},
+        backup=True,
+    )
+    written = json.loads(config_path.read_text())
+    backup = json.loads(result.backup_path.read_text())
+
+    assert result.updated_camera_names == ("d405",)
+    assert backup == original
+    assert written["workspace_crop"] == original["workspace_crop"]
+    assert written["max_points"] == 5000
+    assert written["cameras"][0]["calibrated"] is True
+    assert written["cameras"][0]["world_from_camera"] == world_from_d405.tolist()
+    assert written["cameras"][0]["extrinsic_world_from_cam"] == world_from_d405.tolist()
+    assert written["cameras"][1] == original["cameras"][1]

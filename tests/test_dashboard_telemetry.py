@@ -246,6 +246,42 @@ def test_dashboard_robot_snapshot_omits_joints_when_driver_has_no_names():
     asyncio.run(run())
 
 
+def test_dashboard_snapshot_can_carry_calibration_status_and_world_cloud_mode():
+    class CalibrationPointCloud(CountingPointCloud):
+        def dashboard_pointcloud_frame(self):
+            return "world"
+
+    def calibration_snapshot():
+        return {
+            "mode": "continuous_calibration",
+            "anchor_camera": "d405",
+            "autosave": {"enabled": True, "state": "waiting_for_stability"},
+            "targets": {
+                "d435i": {
+                    "stable": False,
+                    "accepted_samples": 2,
+                    "reprojection_error_px": 0.4,
+                }
+            },
+        }
+
+    hub = TelemetryHub(
+        point_cloud_source=CalibrationPointCloud(),
+        robot_driver=FakeRobot(),
+        workspace=_workspace(),
+        urdf_url="/robot/robot.urdf",
+        urdf_assets_url="/robot/assets/",
+        calibration_snapshot_provider=calibration_snapshot,
+    )
+
+    snap = hub.snapshot()
+
+    assert snap["model"]["pointcloud_frame"] == "world"
+    assert snap["calibration"]["mode"] == "continuous_calibration"
+    assert snap["calibration"]["anchor_camera"] == "d405"
+    assert snap["calibration"]["targets"]["d435i"]["accepted_samples"] == 2
+
+
 def test_resolve_robot_asset_path_allows_assets_under_root(tmp_path):
     root = tmp_path / "robot"
     mesh_dir = root / "meshes"

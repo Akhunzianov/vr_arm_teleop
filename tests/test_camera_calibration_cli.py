@@ -2,20 +2,18 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from scripts.calibrate_two_cameras_charuco import parse_args
 
 
-def test_calibration_cli_parses_board_camera_and_urdf_options():
+def test_calibration_cli_parses_config_driven_options():
     args = parse_args(
         [
-            "--arm-camera",
-            "zed",
-            "--arm-serial",
-            "12345",
-            "--external-camera",
-            "realsense",
-            "--external-serial",
-            "67890",
+            "--cameras",
+            "config/hardware_cameras.json",
+            "--anchor-camera",
+            "d405",
             "--urdf",
             "robot.urdf",
             "--base-link",
@@ -32,28 +30,34 @@ def test_calibration_cli_parses_board_camera_and_urdf_options():
             "0.026",
             "--dictionary",
             "DICT_5X5_100",
-            "--output",
-            "config/cameras.json",
+            "--dashboard-port",
+            "9001",
+            "--rolling-window",
+            "24",
+            "--stability-seconds",
+            "1.5",
+            "--no-autosave",
         ]
     )
 
-    assert args.arm_camera == "zed"
-    assert args.external_camera == "realsense"
+    assert args.cameras == Path("config/hardware_cameras.json")
+    assert args.anchor_camera == "d405"
     assert args.urdf == Path("robot.urdf")
     assert args.base_link == "base"
     assert args.camera_link == "camera_optical"
     assert args.squares_x == 7
     assert args.square_length == 0.035
-    assert args.output == Path("config/cameras.json")
+    assert args.dashboard_port == 9001
+    assert args.rolling_window == 24
+    assert args.stability_seconds == 1.5
+    assert args.autosave is False
 
 
 def test_calibration_cli_defaults_to_canonical_urdf_camera_chain():
     args = parse_args(
         [
-            "--arm-camera",
-            "realsense",
-            "--external-camera",
-            "zed",
+            "--cameras",
+            "config/hardware_cameras.json",
             "--squares-x",
             "7",
             "--squares-y",
@@ -76,8 +80,27 @@ def test_calibration_cli_defaults_to_canonical_urdf_camera_chain():
     )
     assert args.base_link == "world"
     assert args.camera_link == "d405_depth_optical_frame"
+    assert args.anchor_camera is None
+    assert args.dashboard_port == 8001
+    assert args.autosave is True
     assert args.arm_ip == "10.10.10.20"
     assert args.rc5_api_path == Path("/opt/rc5_python_api")
+
+
+def test_calibration_cli_requires_camera_config():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--squares-x",
+                "7",
+                "--squares-y",
+                "5",
+                "--square-length",
+                "0.035",
+                "--marker-length",
+                "0.026",
+            ]
+        )
 
 
 def test_calibration_script_help_runs_as_direct_file():
@@ -89,4 +112,5 @@ def test_calibration_script_help_runs_as_direct_file():
     )
 
     assert result.returncode == 0
-    assert "--arm-camera" in result.stdout
+    assert "--cameras" in result.stdout
+    assert "--anchor-camera" in result.stdout

@@ -22,17 +22,17 @@ loop and the state-transition hooks it relies on.
 Done when: yanking the robot driver offline pops a `fault` overlay
 that the user has to acknowledge.
 
-## 2. Hardware point-cloud calibration ⏱ TBD
+## 2. Hardware point-cloud calibration ✅ implemented, needs hardware validation
 
 Hardware capture/fusion plumbing exists for mixed RealSense and ZED 2i
-configs. The remaining production blocker is camera-to-robot
-calibration; until enabled cameras are marked calibrated, hardware
-capture starts for diagnostics but AR point-cloud display is gated.
+configs. Continuous camera-to-robot calibration now opens the configured
+cameras, trusts the arm-mounted camera FK as the anchor, optimizes
+non-anchor extrinsics from overlapping ChArUco detections, shows the
+provisional world-frame cloud in the dashboard, and autosaves stable
+solutions back into the hardware camera config.
 
-- Replace hand-entered `world_from_camera` matrices with a calibration
-  workflow that estimates camera-to-robot transforms.
-- Persist calibrated transforms into the hardware camera config.
-- Add a calibration QA view or procedure before allowing AR display.
+- Validate the workflow with the physical D405 + D435i camera set.
+- Tune board size, inlier thresholds, and stability window on hardware.
 
 Done when: with the configured cameras on the workspace, the fused
 cloud aligns with the robot/workspace frame in AR.

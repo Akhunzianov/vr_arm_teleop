@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .point_cloud import PointCloudSource, encode_frame
 from .robot import RobotDriver, RobotState
@@ -59,6 +59,16 @@ def _dashboard_camera_feeds(source: PointCloudSource) -> list[dict[str, Any]]:
     return clean
 
 
+def _dashboard_pointcloud_frame(source: PointCloudSource) -> str | None:
+    frame = getattr(source, "dashboard_pointcloud_frame", None)
+    if not callable(frame):
+        return None
+    value = frame()
+    if value is None:
+        return None
+    return str(value)
+
+
 class TelemetryHub:
     """Caches live setup telemetry and fans it out to read-only clients."""
 
@@ -73,6 +83,7 @@ class TelemetryHub:
         pointcloud_hz: float = 15.0,
         robot_hz: float = 30.0,
         status_hz: float = 1.0,
+        calibration_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self._pc = point_cloud_source
         self._robot = robot_driver
@@ -82,6 +93,7 @@ class TelemetryHub:
         self._pointcloud_hz = float(pointcloud_hz)
         self._robot_hz = float(robot_hz)
         self._status_hz = float(status_hz)
+        self._calibration_snapshot_provider = calibration_snapshot_provider
         self._robot_state: RobotState | None = None
         self._robot_error: str | None = None
         self._pointcloud: EncodedPointCloud | None = None
@@ -211,13 +223,18 @@ class TelemetryHub:
     def snapshot(self) -> dict[str, Any]:
         robot = self._robot_state
         cloud = self._pointcloud
-        return {
+        model = {
+            "urdf_url": self._urdf_url,
+            "urdf_assets_url": self._urdf_assets_url,
+            "camera_feeds": _dashboard_camera_feeds(self._pc),
+        }
+        pointcloud_frame = _dashboard_pointcloud_frame(self._pc)
+        if pointcloud_frame is not None:
+            model["pointcloud_frame"] = pointcloud_frame
+
+        snapshot = {
             "type": "snapshot",
-            "model": {
-                "urdf_url": self._urdf_url,
-                "urdf_assets_url": self._urdf_assets_url,
-                "camera_feeds": _dashboard_camera_feeds(self._pc),
-            },
+            "model": model,
             "workspace": {
                 "min": _vec(self._workspace.min_corner),
                 "max": _vec(self._workspace.max_corner),
@@ -255,6 +272,9 @@ class TelemetryHub:
                 "status_hz": self._status_hz,
             },
         }
+        if self._calibration_snapshot_provider is not None:
+            snapshot["calibration"] = self._calibration_snapshot_provider()
+        return snapshot
 
     async def _robot_loop(self) -> None:
         period = 1.0 / max(self._robot_hz, 1e-3)

@@ -173,6 +173,22 @@ cloud cannot be displayed in a physically meaningful robot/world frame.
 Use [config/hardware_cameras.example.json](config/hardware_cameras.example.json)
 as the starting shape.
 
+Run the continuous ChArUco calibration tool to solve those transforms:
+
+```bash
+python scripts/calibrate_two_cameras_charuco.py \
+  --cameras config/hardware_cameras.json \
+  --squares-x 7 --squares-y 5 \
+  --square-length 0.035 --marker-length 0.026
+```
+
+The tool opens every enabled camera in the config, picks the FK-trusted
+anchor from `--anchor-camera` or the camera whose `urdf_link` matches
+`--camera-link`, serves the same Three.js dashboard on
+`--dashboard-port`, and atomically autosaves the input config after all
+non-anchor cameras have stable inlier solutions. The first autosave
+creates a `*.bak` copy beside the config.
+
 ---
 
 ## Architecture

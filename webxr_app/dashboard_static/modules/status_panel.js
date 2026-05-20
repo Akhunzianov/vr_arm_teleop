@@ -40,6 +40,7 @@ export class StatusPanel {
     const cloud = snapshot.pointcloud || {};
     const xr = snapshot.xr || {};
     const status = snapshot.status || {};
+    const calibration = snapshot.calibration || null;
     const jointCount = robot.joints ? Object.keys(robot.joints).length : 0;
     const cameraFeedCount = Array.isArray(model.camera_feeds)
       ? model.camera_feeds.length
@@ -48,6 +49,7 @@ export class StatusPanel {
 
     const robotError = robot.error || 'none';
     const cloudError = cloud.error || 'none';
+    const calibrationHtml = calibration ? this._calibrationHtml(calibration) : '';
     this._status.innerHTML = `
       <div class="status-group">
         ${row('URDF', model.urdf_url || 'none')}
@@ -68,6 +70,29 @@ export class StatusPanel {
       <div class="status-group">
         ${row('Robot error', robotError, robot.error ? 'error' : '')}
         ${row('Cloud error', cloudError, cloud.error ? 'error' : '')}
+      </div>
+      ${calibrationHtml}
+    `;
+  }
+
+  _calibrationHtml(calibration) {
+    const autosave = calibration.autosave || {};
+    const targets = calibration.targets || {};
+    const targetRows = Object.entries(targets).map(([name, target]) => {
+      const stable = target.stable ? 'stable' : 'solving';
+      const cls = target.stable ? '' : 'warn';
+      const reproj = fmtNumber(target.reprojection_error_px, 2);
+      return row(name, `${stable}, ${target.accepted_samples || 0} inliers, ${reproj}px`, cls);
+    }).join('');
+    const error = calibration.error || 'none';
+    return `
+      <div class="status-group">
+        ${row('Cal mode', calibration.mode || 'none')}
+        ${row('Anchor', calibration.anchor_camera || 'none')}
+        ${row('Autosave', autosave.state || 'none', autosave.state === 'saved' ? '' : 'warn')}
+        ${row('All stable', calibration.all_stable ? 'yes' : 'no', calibration.all_stable ? '' : 'warn')}
+        ${targetRows}
+        ${row('Cal error', error, calibration.error ? 'error' : '')}
       </div>
     `;
   }

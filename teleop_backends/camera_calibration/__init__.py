@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import abc
 import importlib
+import json
 import math
+import os
+import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +65,32 @@ class CalibrationResult:
 
 
 @dataclass(frozen=True)
+class CalibrationDetection:
+    """One board pose detected in one camera image."""
+
+    camera_from_board: np.ndarray
+    reprojection_error: float
+    corner_count: int
+
+
+@dataclass(frozen=True)
+class CalibratedConfigWriteResult:
+    """Metadata for an atomic hardware camera config update."""
+
+    path: Path
+    backup_path: Path | None
+    updated_camera_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ExtrinsicSample:
+    world_from_camera: np.ndarray
+    reprojection_error: float
+    corner_count: int
+    timestamp: float
+
+
+@dataclass(frozen=True)
 class CharucoBoardSpec:
     """Metric ChArUco board description supplied from the CLI."""
 
@@ -100,6 +129,228 @@ class CharucoBoardSpec:
             self.marker_length,
             dictionary,
         )
+
+
+def select_anchor_camera(config, *, anchor_name: str | None, camera_link: str):
+    """Select the FK-trusted anchor camera from a hardware config."""
+
+    cameras = tuple(getattr(config, "cameras", ()))
+    if anchor_name:
+        for camera in cameras:
+            if camera.name == anchor_name:
+                return camera
+        raise ValueError(f"anchor camera {anchor_name!r} is not enabled in the config")
+
+    matches = [
+        camera for camera in cameras
+        if getattr(camera, "urdf_link", None) == camera_link
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        names = ", ".join(camera.name for camera in matches)
+        raise ValueError(
+            f"multiple cameras use URDF link {camera_link!r}; pass --anchor-camera "
+            f"explicitly ({names})"
+        )
+    raise ValueError(
+        f"no enabled camera has urdf_link {camera_link!r}; pass --anchor-camera"
+    )
+
+
+class AnchoredExtrinsicOptimizer:
+    """Rolling camera-to-world optimizer using one FK-trusted anchor camera."""
+
+    def __init__(
+        self,
+        *,
+        anchor_name: str,
+        target_names: Iterable[str],
+        min_samples: int = 10,
+        rolling_window: int = 40,
+        min_corners: int = 12,
+        max_reprojection_error_px: float = 2.0,
+        max_pair_translation_deviation_m: float = 0.05,
+        max_pair_rotation_deviation_deg: float = 5.0,
+        translation_stability_m: float = 0.01,
+        rotation_stability_deg: float = 1.0,
+        stability_seconds: float = 2.0,
+    ) -> None:
+        if min_samples <= 0:
+            raise ValueError("min_samples must be positive")
+        if rolling_window < min_samples:
+            raise ValueError("rolling_window must be >= min_samples")
+        self.anchor_name = str(anchor_name)
+        self.target_names = tuple(str(name) for name in target_names)
+        if self.anchor_name in self.target_names:
+            raise ValueError("anchor camera cannot also be a target")
+        self._min_samples = int(min_samples)
+        self._rolling_window = int(rolling_window)
+        self._min_corners = int(min_corners)
+        self._max_reprojection = float(max_reprojection_error_px)
+        self._max_pair_translation = float(max_pair_translation_deviation_m)
+        self._max_pair_rotation = math.radians(float(max_pair_rotation_deviation_deg))
+        self._translation_stability = float(translation_stability_m)
+        self._rotation_stability = float(rotation_stability_deg)
+        self._stability_seconds = float(stability_seconds)
+        self._samples: dict[str, list[_ExtrinsicSample]] = {
+            name: [] for name in self.target_names
+        }
+        self._rejected: dict[str, int] = {name: 0 for name in self.target_names}
+        self._latest_world_from_anchor: np.ndarray | None = None
+        self._latest_timestamp: float | None = None
+
+    def add_frame(
+        self,
+        *,
+        world_from_anchor_camera: np.ndarray,
+        detections: dict[str, CalibrationDetection],
+        timestamp: float,
+    ) -> None:
+        """Consume one synchronized detection batch from all live cameras."""
+
+        world_from_anchor_camera = _as_transform(world_from_anchor_camera)
+        self._latest_world_from_anchor = world_from_anchor_camera
+        self._latest_timestamp = float(timestamp)
+        anchor = detections.get(self.anchor_name)
+        if anchor is None or not self._valid_detection(anchor):
+            for name in self.target_names:
+                if name in detections:
+                    self._rejected[name] += 1
+            return
+
+        anchor_from_board = _as_transform(anchor.camera_from_board)
+        for name in self.target_names:
+            detection = detections.get(name)
+            if detection is None:
+                continue
+            if not self._valid_detection(detection):
+                self._rejected[name] += 1
+                continue
+            world_from_camera = (
+                world_from_anchor_camera
+                @ anchor_from_board
+                @ invert_transform(detection.camera_from_board)
+            )
+            sample = _ExtrinsicSample(
+                world_from_camera=world_from_camera,
+                reprojection_error=max(
+                    float(anchor.reprojection_error),
+                    float(detection.reprojection_error),
+                ),
+                corner_count=min(int(anchor.corner_count), int(detection.corner_count)),
+                timestamp=float(timestamp),
+            )
+            samples = self._samples[name]
+            samples.append(sample)
+            if len(samples) > self._rolling_window:
+                del samples[:-self._rolling_window]
+
+    def status(self) -> dict:
+        targets = {
+            name: self._target_status(name)
+            for name in self.target_names
+        }
+        return {
+            "mode": "continuous_calibration",
+            "anchor_camera": self.anchor_name,
+            "all_stable": bool(targets) and all(
+                target["stable"] for target in targets.values()
+            ),
+            "targets": targets,
+        }
+
+    def stable_transforms(self, *, include_anchor: bool = True) -> dict[str, np.ndarray]:
+        transforms: dict[str, np.ndarray] = {}
+        if include_anchor and self._latest_world_from_anchor is not None:
+            transforms[self.anchor_name] = self._latest_world_from_anchor.copy()
+        for name, status in self.status()["targets"].items():
+            if status["stable"] and status["world_from_camera"] is not None:
+                transforms[name] = np.asarray(
+                    status["world_from_camera"],
+                    dtype=np.float64,
+                )
+        return transforms
+
+    def current_transforms(self, *, include_anchor: bool = True) -> dict[str, np.ndarray]:
+        """Return the latest anchor plus provisional target solutions."""
+
+        transforms: dict[str, np.ndarray] = {}
+        if include_anchor and self._latest_world_from_anchor is not None:
+            transforms[self.anchor_name] = self._latest_world_from_anchor.copy()
+        for name, status in self.status()["targets"].items():
+            if status["world_from_camera"] is not None:
+                transforms[name] = np.asarray(
+                    status["world_from_camera"],
+                    dtype=np.float64,
+                )
+        return transforms
+
+    def _valid_detection(self, detection: CalibrationDetection) -> bool:
+        return (
+            int(detection.corner_count) >= self._min_corners
+            and float(detection.reprojection_error) <= self._max_reprojection
+        )
+
+    def _target_status(self, name: str) -> dict:
+        samples = self._samples[name]
+        base = {
+            "stable": False,
+            "accepted_samples": 0,
+            "rejected_samples": int(self._rejected[name]),
+            "candidate_samples": len(samples),
+            "reprojection_error_px": None,
+            "translation_std_m": None,
+            "rotation_std_deg": None,
+            "world_from_camera": None,
+            "last_timestamp": None if not samples else float(samples[-1].timestamp),
+        }
+        if len(samples) < self._min_samples:
+            return base
+
+        preliminary = _average_transforms(sample.world_from_camera for sample in samples)
+        accepted: list[_ExtrinsicSample] = []
+        translation_errors = []
+        rotation_errors = []
+        for sample in samples:
+            transform = _as_transform(sample.world_from_camera)
+            translation_error = float(np.linalg.norm(transform[:3, 3] - preliminary[:3, 3]))
+            rotation_error = _rotation_angle(preliminary[:3, :3].T @ transform[:3, :3])
+            if (
+                translation_error <= self._max_pair_translation
+                and rotation_error <= self._max_pair_rotation
+            ):
+                accepted.append(sample)
+                translation_errors.append(translation_error)
+                rotation_errors.append(rotation_error)
+
+        if len(accepted) < self._min_samples:
+            rejected = self._rejected[name] + (len(samples) - len(accepted))
+            return {**base, "rejected_samples": int(rejected)}
+
+        solution = _average_transforms(sample.world_from_camera for sample in accepted)
+        reprojection = float(np.mean([sample.reprojection_error for sample in accepted]))
+        translation_std = float(np.std(translation_errors)) if translation_errors else 0.0
+        rotation_std = (
+            float(np.degrees(np.std(rotation_errors)))
+            if rotation_errors else 0.0
+        )
+        time_span = float(accepted[-1].timestamp - accepted[0].timestamp)
+        stable = (
+            translation_std <= self._translation_stability
+            and rotation_std <= self._rotation_stability
+            and time_span >= self._stability_seconds
+        )
+        return {
+            **base,
+            "stable": bool(stable),
+            "accepted_samples": len(accepted),
+            "rejected_samples": int(self._rejected[name] + len(samples) - len(accepted)),
+            "reprojection_error_px": reprojection,
+            "translation_std_m": translation_std,
+            "rotation_std_deg": rotation_std,
+            "world_from_camera": solution.tolist(),
+        }
 
 
 class CameraFeed(abc.ABC):
@@ -531,6 +782,50 @@ def _camera_config_entry(camera: CameraDescriptor, world_from_camera: np.ndarray
     return entry
 
 
+def write_calibrated_hardware_config(
+    path: Path,
+    world_from_camera_by_name: dict[str, np.ndarray],
+    *,
+    backup: bool = True,
+) -> CalibratedConfigWriteResult:
+    """Atomically update enabled camera extrinsics in an existing config."""
+
+    path = Path(path)
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or not isinstance(data.get("cameras"), list):
+        raise ValueError("hardware camera config requires a top-level cameras list")
+
+    backup_path = None
+    if backup:
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        if not backup_path.exists():
+            shutil.copy2(path, backup_path)
+
+    updated: list[str] = []
+    for camera in data["cameras"]:
+        if not isinstance(camera, dict):
+            continue
+        if camera.get("enabled", True) is False:
+            continue
+        name = str(camera.get("name", ""))
+        if name not in world_from_camera_by_name:
+            continue
+        world_from_camera = _as_transform(world_from_camera_by_name[name]).tolist()
+        camera["calibrated"] = True
+        camera["world_from_camera"] = world_from_camera
+        camera["extrinsic_world_from_cam"] = world_from_camera
+        updated.append(name)
+
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+    return CalibratedConfigWriteResult(
+        path=path,
+        backup_path=backup_path,
+        updated_camera_names=tuple(updated),
+    )
+
+
 def _average_transforms(transforms: Iterable[np.ndarray]) -> np.ndarray:
     transforms = [_as_transform(transform) for transform in transforms]
     translations = np.asarray([transform[:3, 3] for transform in transforms], dtype=np.float64)
@@ -680,8 +975,11 @@ def _zed_enum(enum_cls, value: str | None, default: str):
 
 
 __all__ = [
+    "AnchoredExtrinsicOptimizer",
     "CameraDescriptor",
     "CameraFeed",
+    "CalibratedConfigWriteResult",
+    "CalibrationDetection",
     "CalibrationObservation",
     "CalibrationResult",
     "CharucoBoardSpec",
@@ -694,5 +992,7 @@ __all__ = [
     "estimate_two_camera_extrinsics",
     "invert_transform",
     "rotation_matrix_from_axis_angle",
+    "select_anchor_camera",
     "transform_from_rt",
+    "write_calibrated_hardware_config",
 ]

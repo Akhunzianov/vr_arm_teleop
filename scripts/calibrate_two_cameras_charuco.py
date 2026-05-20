@@ -1,20 +1,28 @@
-"""Calibrate external + arm-mounted cameras with a ChArUco board.
+"""Continuously calibrate configured cameras with a ChArUco board.
 
-The solver trusts the URDF/FK pose of the arm-mounted camera in the robot
-base frame, then estimates the external camera from paired ChArUco board
-poses. Output matrices use OpenCV optical camera frames.
+The live solver trusts the URDF/FK pose of the arm-mounted anchor camera
+in the robot base frame. Every other enabled camera is optimized from
+frames where both it and the anchor see the same ChArUco board. Output
+matrices use OpenCV optical camera frames and are written as
+``world_from_camera`` matrices compatible with the hardware point-cloud
+backend.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import importlib
 import json
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
+from aiohttp import WSMsgType, web
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,22 +30,34 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from teleop_backends.camera_calibration import (
+    AnchoredExtrinsicOptimizer,
     CameraDescriptor,
-    CalibrationObservation,
-    CameraFeed,
+    CalibrationDetection,
     CharucoBoardSpec,
     JointStateProvider,
-    RealSenseColorFeed,
     UrdfKinematicTree,
-    ZedColorFeed,
-    build_hardware_camera_config,
-    estimate_two_camera_extrinsics,
+    select_anchor_camera,
     transform_from_rt,
+    write_calibrated_hardware_config,
+)
+from teleop_backends.pointcloud.hardware import (
+    HardwareCameraConfig,
+    HardwarePointCloudConfig,
+    CameraPointCloudReader,
+    default_reader_factory,
+    fuse_camera_frames,
+    load_hardware_config,
 )
 from teleop_backends.robot.rc5_state import (
     RC5_ARM_JOINT_NAMES,
     RC5JointStateReader,
 )
+from teleop_core.point_cloud import PointCloudFrame
+from teleop_core.robot import RobotState
+from teleop_core.server import _resolve_robot_asset_path
+from teleop_core.telemetry import TelemetryHub
+from teleop_core.types import Pose
+from teleop_core.workspace import Workspace
 
 
 @dataclass(frozen=True)
@@ -49,7 +69,7 @@ class _Detection:
 
 
 class JsonJointStateProvider(JointStateProvider):
-    """Development provider for a fixed calibration pose snapshot."""
+    """Development provider for a fixed or externally refreshed joint JSON."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -61,24 +81,273 @@ class JsonJointStateProvider(JointStateProvider):
         return {str(name): float(value) for name, value in data.items()}
 
 
+class CalibrationPointCloudSource:
+    """Captures all cameras, optimizes extrinsics, and emits world clouds."""
+
+    def __init__(
+        self,
+        *,
+        config_path: Path,
+        config: HardwarePointCloudConfig,
+        anchor: HardwareCameraConfig,
+        optimizer: AnchoredExtrinsicOptimizer,
+        joint_provider: JointStateProvider,
+        kinematic_tree: UrdfKinematicTree,
+        base_link: str,
+        camera_link: str,
+        board,
+        cv2,
+        min_corners: int,
+        autosave: bool,
+        reader_factory=default_reader_factory,
+    ) -> None:
+        self._config_path = Path(config_path)
+        self._config = config
+        self._anchor = anchor
+        self._optimizer = optimizer
+        self._joint_provider = joint_provider
+        self._kinematic_tree = kinematic_tree
+        self._base_link = base_link
+        self._camera_link = camera_link
+        self._board = board
+        self._cv2 = cv2
+        self._min_corners = int(min_corners)
+        self._autosave = bool(autosave)
+        self._reader_factory = reader_factory
+        self._readers: list[tuple[HardwareCameraConfig, CameraPointCloudReader]] = []
+        self._descriptors: dict[str, CameraDescriptor] = {}
+        self.latest_joint_state: dict[str, float] = {}
+        self._latest_detections: dict[str, dict] = {}
+        self._latest_transforms: dict[str, list[list[float]]] = {}
+        self._latest_board_poses: dict[str, list[list[float]]] = {}
+        self._latest_error: str | None = None
+        self._autosave_state = "disabled" if not autosave else "waiting_for_stability"
+        self._last_saved_timestamp: float | None = None
+        self._saved_current_stable_set = False
+
+    async def start(self) -> None:
+        if self._readers:
+            return
+        self._readers = [
+            (camera, self._reader_factory(camera))
+            for camera in self._config.cameras
+        ]
+        for _, reader in self._readers:
+            await reader.start()
+        self._descriptors = {}
+        for camera, reader in self._readers:
+            descriptor = reader.descriptor()
+            if descriptor is not None:
+                self._descriptors[camera.name] = descriptor
+
+    async def stop(self) -> None:
+        for _, reader in reversed(self._readers):
+            with contextlib.suppress(Exception):
+                await reader.stop()
+        self._readers = []
+
+    async def grab(self) -> Optional[PointCloudFrame]:
+        if not self._readers:
+            return None
+
+        raw_frames: list[tuple[HardwareCameraConfig, PointCloudFrame]] = []
+        detections: dict[str, CalibrationDetection] = {}
+        detection_status: dict[str, dict] = {}
+
+        try:
+            joint_state = await asyncio.to_thread(self._joint_provider.read_joint_state)
+            self.latest_joint_state = joint_state
+            world_from_anchor = self._kinematic_tree.transform(
+                self._base_link,
+                self._camera_link,
+                joint_state,
+            )
+            self._latest_error = None
+        except Exception as exc:
+            self._latest_error = repr(exc)
+            return None
+
+        for camera, reader in self._readers:
+            frame = await reader.grab_camera_frame()
+            if frame is not None:
+                raw_frames.append((camera, frame))
+            image = reader.latest_color_rgb()
+            descriptor = self._descriptors.get(camera.name)
+            if image is None or descriptor is None:
+                detection_status[camera.name] = {
+                    "detected": False,
+                    "reason": "frame_or_intrinsics_unavailable",
+                }
+                continue
+            detection = _detect_board_pose(
+                self._cv2,
+                self._board,
+                image,
+                descriptor,
+                min_corners=self._min_corners,
+            )
+            if detection is None:
+                detection_status[camera.name] = {
+                    "detected": False,
+                    "reason": "board_not_found",
+                }
+                continue
+            detections[camera.name] = CalibrationDetection(
+                camera_from_board=detection.camera_from_board,
+                reprojection_error=detection.reprojection_error,
+                corner_count=detection.corner_count,
+            )
+            detection_status[camera.name] = {
+                "detected": True,
+                "reprojection_error_px": detection.reprojection_error,
+                "corner_count": detection.corner_count,
+            }
+
+        self._latest_detections = detection_status
+        self._optimizer.add_frame(
+            world_from_anchor_camera=world_from_anchor,
+            detections=detections,
+            timestamp=time.monotonic(),
+        )
+        self._maybe_autosave()
+
+        transforms = self._optimizer.current_transforms(include_anchor=True)
+        self._latest_transforms = {
+            name: transform.tolist()
+            for name, transform in transforms.items()
+        }
+        self._latest_board_poses = {
+            name: (transforms[name] @ detection.camera_from_board).tolist()
+            for name, detection in detections.items()
+            if name in transforms
+        }
+        transformed_frames = [
+            (
+                replace(
+                    camera,
+                    world_from_camera=np.asarray(
+                        transforms.get(camera.name, camera.world_from_camera),
+                        dtype=np.float32,
+                    ),
+                    calibrated=True,
+                ),
+                frame,
+            )
+            for camera, frame in raw_frames
+        ]
+        return fuse_camera_frames(
+            transformed_frames,
+            workspace_crop=self._config.workspace_crop,
+            max_points=self._config.max_points,
+        )
+
+    def dashboard_pointcloud_frame(self) -> str:
+        return "world"
+
+    def dashboard_camera_feeds(self) -> list[dict[str, object]]:
+        feeds = []
+        for camera, _ in self._readers:
+            if not camera.urdf_link:
+                continue
+            feeds.append({
+                "name": camera.name,
+                "urdf_link": camera.urdf_link,
+                "url": f"/api/cameras/{quote(camera.name, safe='')}/color.jpg",
+                "width": int(camera.width),
+                "height": int(camera.height),
+            })
+        return feeds
+
+    def latest_color_jpeg(self, camera_name: str) -> bytes | None:
+        for camera, reader in self._readers:
+            if camera.name == camera_name:
+                return reader.latest_color_jpeg()
+        return None
+
+    def calibration_snapshot(self) -> dict:
+        status = self._optimizer.status()
+        cameras = [
+            {
+                "name": camera.name,
+                "type": camera.camera_type,
+                "serial": camera.serial,
+                "urdf_link": camera.urdf_link,
+                "anchor": camera.name == self._anchor.name,
+                "detection": self._latest_detections.get(camera.name, {
+                    "detected": False,
+                    "reason": "not_sampled",
+                }),
+            }
+            for camera in self._config.cameras
+        ]
+        return {
+            **status,
+            "cameras": cameras,
+            "world_from_camera": self._latest_transforms,
+            "world_from_board": self._latest_board_poses,
+            "autosave": {
+                "enabled": self._autosave,
+                "state": self._autosave_state,
+                "last_saved_timestamp": self._last_saved_timestamp,
+            },
+            "error": self._latest_error,
+        }
+
+    def _maybe_autosave(self) -> None:
+        if not self._autosave:
+            return
+        status = self._optimizer.status()
+        if not status["all_stable"]:
+            self._autosave_state = "waiting_for_stability"
+            self._saved_current_stable_set = False
+            return
+        if self._saved_current_stable_set:
+            self._autosave_state = "saved"
+            return
+        write_calibrated_hardware_config(
+            self._config_path,
+            self._optimizer.stable_transforms(include_anchor=True),
+            backup=True,
+        )
+        self._last_saved_timestamp = time.monotonic()
+        self._autosave_state = "saved"
+        self._saved_current_stable_set = True
+
+
+class CalibrationRobotAdapter:
+    """Tiny robot-state adapter so the shared dashboard can pose the URDF."""
+
+    def __init__(self, source: CalibrationPointCloudSource) -> None:
+        self._source = source
+
+    async def get_state(self) -> RobotState:
+        joint_state = self._source.latest_joint_state
+        names = [
+            name for name in RC5_ARM_JOINT_NAMES
+            if name in joint_state
+        ]
+        names.extend(name for name in sorted(joint_state) if name not in names)
+        return RobotState(
+            wrist_pose=Pose.identity(frame="world"),
+            joint_angles=np.asarray([joint_state[name] for name in names], dtype=np.float32),
+            finger_curls=np.zeros(5, dtype=np.float32),
+            timestamp=time.monotonic(),
+            joint_names=tuple(names),
+        )
+
+
 def _default_urdf() -> Path:
     return REPO_ROOT / "urdf_rc5_right_hand" / "urdf_with_simple_collisions.urdf"
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
-
-    ap.add_argument("--arm-camera", choices=("realsense", "zed"), required=True)
-    ap.add_argument("--arm-name", default="arm-camera")
-    ap.add_argument("--arm-serial", default=None)
-    ap.add_argument("--external-camera", choices=("realsense", "zed"), required=True)
-    ap.add_argument("--external-name", default="external-camera")
-    ap.add_argument("--external-serial", default=None)
-
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--zed-resolution", default="HD720")
+    ap.add_argument("--cameras", type=Path, required=True,
+                    help="hardware camera config JSON to open and autosave")
+    ap.add_argument("--anchor-camera", default=None,
+                    help="FK-trusted camera name; defaults to --camera-link match")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--dashboard-port", type=int, default=8001)
 
     ap.add_argument("--urdf", type=Path, default=_default_urdf())
     ap.add_argument("--base-link", default="world")
@@ -89,7 +358,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--joint-state-json",
         type=Path,
         default=None,
-        help="offline fixed-pose joint snapshot; omit to read the live RC5 joints",
+        help="offline/live joint JSON; omit to read live RC5 joints",
     )
 
     ap.add_argument("--squares-x", type=int, required=True)
@@ -101,16 +370,31 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--min-samples", type=int, default=10)
     ap.add_argument("--min-corners", type=int, default=12)
     ap.add_argument("--max-reprojection-error", type=float, default=2.0)
-    ap.add_argument("--output", type=Path, default=Path("config/cameras.json"))
+    ap.add_argument("--rolling-window", type=int, default=40)
+    ap.add_argument("--stability-seconds", type=float, default=2.0)
+    ap.add_argument("--max-pair-translation-deviation", type=float, default=0.05)
+    ap.add_argument("--max-pair-rotation-deviation", type=float, default=5.0)
+    ap.add_argument("--translation-stability", type=float, default=0.01)
+    ap.add_argument("--rotation-stability", type=float, default=1.0)
+    ap.add_argument(
+        "--autosave",
+        dest="autosave",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="atomically autosave stable all-camera solutions",
+    )
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
-    run_interactive_calibration(args)
+    try:
+        asyncio.run(run_continuous_calibration(args))
+    except KeyboardInterrupt:
+        pass
 
 
-def run_interactive_calibration(args: argparse.Namespace) -> None:
+async def run_continuous_calibration(args: argparse.Namespace) -> None:
     cv2 = _require_cv2_aruco()
     board_spec = CharucoBoardSpec(
         squares_x=args.squares_x,
@@ -121,135 +405,79 @@ def run_interactive_calibration(args: argparse.Namespace) -> None:
     )
     board = board_spec.create_cv2_board()
 
-    joint_provider = _make_joint_state_provider(args)
-    joint_state = joint_provider.read_joint_state()
-    _print_fk_inputs(args, joint_state)
-    world_from_arm_camera = UrdfKinematicTree.from_file(args.urdf).transform(
-        args.base_link,
-        args.camera_link,
-        joint_state,
+    hardware_config = load_hardware_config(args.cameras)
+    anchor = select_anchor_camera(
+        hardware_config,
+        anchor_name=args.anchor_camera,
+        camera_link=args.camera_link,
     )
-
-    arm_feed = _make_feed(
-        args.arm_camera,
-        name=args.arm_name,
-        serial=args.arm_serial,
-        width=args.width,
-        height=args.height,
-        fps=args.fps,
-        zed_resolution=args.zed_resolution,
+    target_names = tuple(
+        camera.name for camera in hardware_config.cameras
+        if camera.name != anchor.name
     )
-    external_feed = _make_feed(
-        args.external_camera,
-        name=args.external_name,
-        serial=args.external_serial,
-        width=args.width,
-        height=args.height,
-        fps=args.fps,
-        zed_resolution=args.zed_resolution,
-    )
+    if not target_names:
+        raise SystemExit("continuous calibration requires at least one non-anchor camera")
 
-    observations: list[CalibrationObservation] = []
-    try:
-        arm_feed.start()
-        external_feed.start()
-        arm_descriptor = arm_feed.descriptor()
-        external_descriptor = external_feed.descriptor()
-        print("[calib] Press SPACE/C to accept a stable paired sample; Q/ESC quits.")
-        while True:
-            arm_image = arm_feed.read_color()
-            external_image = external_feed.read_color()
-            if arm_image is None or external_image is None:
-                continue
-
-            arm_detection = _detect_board_pose(
-                cv2,
-                board,
-                arm_image,
-                arm_descriptor,
-                min_corners=args.min_corners,
-            )
-            external_detection = _detect_board_pose(
-                cv2,
-                board,
-                external_image,
-                external_descriptor,
-                min_corners=args.min_corners,
-            )
-
-            display = _display_pair(
-                cv2,
-                arm_detection.overlay_rgb if arm_detection else arm_image,
-                external_detection.overlay_rgb if external_detection else external_image,
-                len(observations),
-            )
-            cv2.imshow("two-camera ChArUco calibration", display)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                if len(observations) >= args.min_samples:
-                    break
-                raise SystemExit("calibration cancelled before enough samples were captured")
-            if key in (ord(" "), ord("c")):
-                if arm_detection is None or external_detection is None:
-                    print("[calib] rejected: both cameras must detect enough ChArUco corners")
-                    continue
-                if (
-                    arm_detection.reprojection_error > args.max_reprojection_error
-                    or external_detection.reprojection_error > args.max_reprojection_error
-                ):
-                    print(
-                        "[calib] rejected: reprojection error too high "
-                        f"(arm={arm_detection.reprojection_error:.3f}px, "
-                        f"external={external_detection.reprojection_error:.3f}px)"
-                    )
-                    continue
-                observations.append(
-                    CalibrationObservation(
-                        arm_camera_from_board=arm_detection.camera_from_board,
-                        external_camera_from_board=external_detection.camera_from_board,
-                        arm_reprojection_error=arm_detection.reprojection_error,
-                        external_reprojection_error=external_detection.reprojection_error,
-                        corner_count=min(arm_detection.corner_count, external_detection.corner_count),
-                    )
-                )
-                print(
-                    f"[calib] accepted sample {len(observations)} "
-                    f"(arm={arm_detection.reprojection_error:.3f}px, "
-                    f"external={external_detection.reprojection_error:.3f}px)"
-                )
-                if len(observations) >= args.min_samples:
-                    print("[calib] minimum sample count reached; press Q to stop or capture more.")
-    finally:
-        arm_feed.stop()
-        external_feed.stop()
-        try:
-            cv2.destroyWindow("two-camera ChArUco calibration")
-        except Exception:
-            pass
-
-    result = estimate_two_camera_extrinsics(
-        observations,
-        world_from_arm_camera=world_from_arm_camera,
+    optimizer = AnchoredExtrinsicOptimizer(
+        anchor_name=anchor.name,
+        target_names=target_names,
         min_samples=args.min_samples,
+        rolling_window=args.rolling_window,
         min_corners=args.min_corners,
         max_reprojection_error_px=args.max_reprojection_error,
+        max_pair_translation_deviation_m=args.max_pair_translation_deviation,
+        max_pair_rotation_deviation_deg=args.max_pair_rotation_deviation,
+        translation_stability_m=args.translation_stability,
+        rotation_stability_deg=args.rotation_stability,
+        stability_seconds=args.stability_seconds,
     )
-    output = build_hardware_camera_config(
-        result,
-        arm_camera=arm_descriptor,
-        external_camera=external_descriptor,
+    source = CalibrationPointCloudSource(
+        config_path=args.cameras,
+        config=hardware_config,
+        anchor=anchor,
+        optimizer=optimizer,
+        joint_provider=_make_joint_state_provider(args),
+        kinematic_tree=UrdfKinematicTree.from_file(args.urdf),
+        base_link=args.base_link,
+        camera_link=args.camera_link,
+        board=board,
+        cv2=cv2,
+        min_corners=args.min_corners,
+        autosave=args.autosave,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(output, indent=2))
-    print(f"[calib] wrote {args.output}")
-    print(
-        "[calib] metrics: "
-        f"accepted={result.accepted_samples}, rejected={result.rejected_samples}, "
-        f"arm_reproj={result.mean_arm_reprojection_error:.3f}px, "
-        f"external_reproj={result.mean_external_reprojection_error:.3f}px, "
-        f"translation_std={result.translation_std_m:.4f}m, "
-        f"rotation_std={result.rotation_std_deg:.3f}deg"
+    workspace = _workspace_from_config(hardware_config)
+    robot = CalibrationRobotAdapter(source)
+    hub = TelemetryHub(
+        point_cloud_source=source,
+        robot_driver=robot,
+        workspace=workspace,
+        urdf_url="/robot/robot.urdf",
+        urdf_assets_url="/robot/assets/",
+        calibration_snapshot_provider=source.calibration_snapshot,
     )
+
+    await source.start()
+    await hub.start()
+    app = _make_dashboard_app(
+        hub=hub,
+        source=source,
+        static_dir=REPO_ROOT / "webxr_app" / "dashboard_static",
+        urdf_path=args.urdf,
+        robot_assets_root=args.urdf.parent,
+    )
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, args.host, args.dashboard_port)
+    try:
+        await site.start()
+        print(f"[calib] anchor camera: {anchor.name}")
+        print(f"[calib] target cameras: {', '.join(target_names)}")
+        print(f"[calib] dashboard on http://{args.host}:{args.dashboard_port}")
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+        await hub.stop()
+        await source.stop()
 
 
 def _make_joint_state_provider(args: argparse.Namespace) -> JointStateProvider:
@@ -261,50 +489,108 @@ def _make_joint_state_provider(args: argparse.Namespace) -> JointStateProvider:
     )
 
 
-def _print_fk_inputs(args: argparse.Namespace, joint_state: dict[str, float]) -> None:
-    print(f"[calib] URDF: {Path(args.urdf).resolve()}")
-    print(f"[calib] FK chain: {args.base_link} -> {args.camera_link}")
-    ordered_names = [
-        name for name in RC5_ARM_JOINT_NAMES
-        if name in joint_state
-    ]
-    ordered_names.extend(
-        name for name in sorted(joint_state)
-        if name not in ordered_names
+def _workspace_from_config(config: HardwarePointCloudConfig) -> Workspace:
+    if config.workspace_crop is not None:
+        min_corner, max_corner = config.workspace_crop
+        return Workspace(
+            min_corner=np.asarray(min_corner, dtype=np.float32),
+            max_corner=np.asarray(max_corner, dtype=np.float32),
+        )
+    return Workspace(
+        min_corner=np.array([-0.5, -0.5, 0.0], dtype=np.float32),
+        max_corner=np.array([0.8, 0.8, 1.2], dtype=np.float32),
     )
-    joints = ", ".join(
-        f"{name}={joint_state[name]:.6f}"
-        for name in ordered_names
-    )
-    print(f"[calib] arm joints rad: {joints}")
 
 
-def _make_feed(
-    kind: str,
+def _make_dashboard_app(
     *,
-    name: str,
-    serial: str | None,
-    width: int,
-    height: int,
-    fps: int,
-    zed_resolution: str,
-) -> CameraFeed:
-    if kind == "realsense":
-        return RealSenseColorFeed(
-            serial=serial,
-            width=width,
-            height=height,
-            fps=fps,
-            name=name,
+    hub: TelemetryHub,
+    source: CalibrationPointCloudSource,
+    static_dir: Path,
+    urdf_path: Path,
+    robot_assets_root: Path,
+) -> web.Application:
+    app = web.Application()
+
+    async def snapshot(_request) -> web.Response:
+        return web.json_response(hub.snapshot())
+
+    async def camera_color(request) -> web.Response:
+        image = source.latest_color_jpeg(request.match_info["name"])
+        if image is None:
+            return web.Response(status=404, text="camera frame not ready")
+        return web.Response(
+            body=image,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
         )
-    if kind == "zed":
-        return ZedColorFeed(
-            serial=serial,
-            resolution=zed_resolution,
-            fps=fps,
-            name=name,
-        )
-    raise ValueError(f"unsupported camera type {kind!r}")
+
+    async def robot_asset(request) -> web.StreamResponse:
+        try:
+            path = _resolve_robot_asset_path(robot_assets_root, request.match_info["tail"])
+        except ValueError:
+            return web.Response(status=404)
+        if not path.exists() or not path.is_file():
+            return web.Response(status=404)
+        return web.FileResponse(path)
+
+    async def dashboard_ws(request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str(json.dumps(hub.snapshot()))
+
+        async def json_loop() -> None:
+            while not ws.closed:
+                try:
+                    await ws.send_str(json.dumps(hub.snapshot()))
+                except ConnectionResetError:
+                    break
+                await asyncio.sleep(1.0 / 20.0)
+
+        async def cloud_loop() -> None:
+            last_sequence = 0
+            while not ws.closed:
+                cloud = await hub.wait_for_pointcloud(
+                    after_sequence=last_sequence,
+                    timeout=1.0,
+                )
+                if cloud is None:
+                    continue
+                last_sequence = cloud.sequence
+                try:
+                    await ws.send_bytes(cloud.payload)
+                except ConnectionResetError:
+                    break
+
+        tasks = [
+            asyncio.create_task(json_loop(), name="calibration_dashboard_json_loop"),
+            asyncio.create_task(cloud_loop(), name="calibration_dashboard_cloud_loop"),
+        ]
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.ERROR:
+                    break
+                if msg.type == WSMsgType.TEXT:
+                    await ws.send_str(json.dumps({
+                        "type": "error",
+                        "message": "calibration dashboard is read-only",
+                    }))
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        return ws
+
+    app.router.add_get("/ws", dashboard_ws)
+    app.router.add_get("/api/snapshot", snapshot)
+    app.router.add_get("/api/cameras/{name}/color.jpg", camera_color)
+    app.router.add_get("/robot/robot.urdf", lambda _request: web.FileResponse(urdf_path))
+    app.router.add_get("/robot/assets/{tail:.*}", robot_asset)
+    app.router.add_get("/", lambda _request: web.FileResponse(static_dir / "index.html"))
+    app.router.add_static("/", path=str(static_dir), show_index=False)
+    return app
 
 
 def _detect_board_pose(
@@ -388,32 +674,6 @@ def _charuco_reprojection_error(
     projected = projected.reshape(-1, 2)
     observed = np.asarray(charuco_corners, dtype=np.float32).reshape(-1, 2)
     return float(np.sqrt(np.mean(np.sum((projected - observed) ** 2, axis=1))))
-
-
-def _display_pair(cv2, arm_rgb: np.ndarray, external_rgb: np.ndarray, sample_count: int) -> np.ndarray:
-    target_height = min(arm_rgb.shape[0], external_rgb.shape[0], 720)
-    arm = _resize_to_height(cv2, arm_rgb, target_height)
-    external = _resize_to_height(cv2, external_rgb, target_height)
-    display_rgb = np.concatenate([arm, external], axis=1)
-    cv2.putText(
-        display_rgb,
-        f"samples: {sample_count}",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
-    return cv2.cvtColor(display_rgb, cv2.COLOR_RGB2BGR)
-
-
-def _resize_to_height(cv2, image: np.ndarray, target_height: int) -> np.ndarray:
-    if image.shape[0] == target_height:
-        return image
-    scale = target_height / image.shape[0]
-    width = max(1, int(round(image.shape[1] * scale)))
-    return cv2.resize(image, (width, target_height), interpolation=cv2.INTER_AREA)
 
 
 def _require_cv2_aruco():
