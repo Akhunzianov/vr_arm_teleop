@@ -4,18 +4,23 @@ Ordered punchlist of remaining work. Each item lists the files
 you'll touch and a rough effort. Pick one numbered item, read the
 relevant interface files, implement it.
 
-## 1. Safety monitor + warning overlay ⏱ 1.5h
+## 1. Safety monitor ⏱ 1h
 
-- `teleop_core/safety.SafetyMonitor.step` — lag detection +
-  workspace exit.
-- `TeleopServer._safety_loop` — call `step`, broadcast `SafetyMsg`.
-- A few remaining `TeleopServer` state-transition hooks
+Workspace-exit feedback is already wired client-side (warning panel
++ red wireframe). What's still missing is the *server-side* safety
+loop and the state-transition hooks it relies on.
+
+- `teleop_core/safety.SafetyMonitor.step` — lag detection
+  (commanded vs actual wrist) and stale-state detection.
+- `TeleopServer._safety_loop` — call `step`, broadcast `SafetyMsg`,
+  pause the tracker when severity escalates.
+- Remaining `TeleopServer` state-transition hooks
   (`_enter_finger_cal`, `_finish_finger_cal`, `_engage_tracking`,
-  `_disengage_tracking`, `_fault`).
-- Frontend: overlay color + workspace-view highlight.
+  `_disengage_tracking`, `_fault`) — currently stubs raising
+  `NotImplementedError`.
 
-Done when: stepping outside the box flashes the box red and shows a
-red prompt; the robot pauses at the boundary.
+Done when: yanking the robot driver offline pops a `fault` overlay
+that the user has to acknowledge.
 
 ## 2. Multi-camera RealSense source ⏱ 3h
 

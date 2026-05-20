@@ -35,8 +35,26 @@ Implemented:
 - **WebXR frontend** (`webxr_app/static/`) — Three.js scene + WebXR
   session, per-frame input reader, tracked-hand visualization,
   controller models, point-cloud renderer bound to the binary stream,
-  workspace wireframe, head-locked overlay panels, calibration state
-  machine, finger-curl + thumb-abduction math.
+  workspace wireframe, head-locked overlay panels (with word-wrap and
+  wider geometry so long prompts fit), calibration state machine,
+  finger-curl + thumb-abduction math.
+- **Ghost hand** — a translucent cyan FBX hand rendered as a
+  re-engage / alignment target. Two modes: (a) *starting ghost* drawn
+  the first time we hit `ready` — wrist position follows the user,
+  orientation + finger curls mirror the robot's current state via a
+  one-shot `RobotEchoMsg`; (b) *re-engage ghost* captured on trigger
+  release and held in place until the user returns to that pose. The
+  engage path gates on a position + orientation tolerance.
+- **Thumb abduction end-to-end** — calibration captures min/max raw
+  abduction, server applies the remap, `RobotCommand.target_thumb_abduction`
+  carries the normalized value, and both pybullet drivers drive
+  `right_thumb_cmc_abd` into a tightened band (URDF allows 100°, we
+  cap to a more realistic ~6°–63°). Calibration prompt order +
+  MIN/MAX bounds were aligned with the joint's natural direction.
+- **Client-side workspace-exit warning** — when the user wrist leaves
+  the workspace box the warning panel lights up and the workspace
+  wireframe flashes red. Server-side `SafetyMonitor` (lag + stale-state
+  detection) is still pending.
 - **CLI wiring** (`webxr_app/__main__.py`) — picks pc/robot backends,
   derives the workspace box from the robot's home pose (or reads it
   from `--workspace path.json`), starts the HTTPS+WS server.
@@ -95,14 +113,20 @@ python -m webxr_app --pc-backend mock --robot-backend pybullet
 
 1. **Finger calibration** — head-locked panel walks through 6 poses;
    press **X** on the left controller to advance each step.
-2. **Engage tracking** — hold the **left trigger**. The server
+2. **Align to the ghost** — once calibration finishes, a translucent
+   cyan hand appears at your wrist with the robot's current
+   orientation and finger pose. Twist your wrist + curl your fingers
+   to match it before pulling the trigger.
+3. **Engage tracking** — hold the **left trigger**. The server
    snapshots `(user_wrist_now, robot_wrist_now)` as the anchor pair.
-3. **Track** — move your right hand; the robot wrist follows by
+4. **Track** — move your right hand; the robot wrist follows by
    `target = robot_anchor + (user_wrist_now - user_anchor)`, clamped
-   to the workspace box. Finger curls stream through normalised
-   against the calibration.
-4. **Disengage** — release the trigger.
-5. **Quit** — press **Y**.
+   to the workspace box. Finger curls + thumb abduction stream
+   through normalised against the calibration. Stepping outside the
+   workspace pops a warning and the box flashes red.
+5. **Disengage** — release the trigger. A ghost hand stays where you
+   let go; you must return roughly to that pose to re-engage.
+6. **Quit** — press **Y**.
 
 ### CLI flags
 

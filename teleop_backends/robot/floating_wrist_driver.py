@@ -35,6 +35,11 @@ _DEFAULT_FINGER_JOINT_GROUPS: dict[int, tuple[str, ...]] = {
 
 _THUMB_OPPOSITION_JOINT = "right_thumb_cmc_abd"
 _THUMB_OPPOSITION_DEFAULT_RAD = 0.5
+# URDF allows [0, 1.745] rad (100°) but realistic CMC abduction range is
+# closer to ~50–60°. Map normalised abduction into this narrower band so
+# typical user thumb motion doesn't saturate the joint.
+_THUMB_ABD_MIN_RAD = 0.2
+_THUMB_ABD_MAX_RAD = 0.85
 
 _DEFAULT_EE_LINK_NAME = "right_tcp_link"
 _DEFAULT_HOME_POS = (0.3, 0.3, 0.3)
@@ -183,6 +188,7 @@ class FloatingWristDriver(RobotDriver):
             raise RuntimeError("FloatingWristDriver.send called before start()")
         target_pose = cmd.target_wrist_pose
         target_curls = cmd.target_finger_curls
+        target_abd = cmd.target_thumb_abduction
 
         def _apply() -> None:
             if target_pose is not None:
@@ -209,6 +215,12 @@ class FloatingWristDriver(RobotDriver):
                 for finger, c in enumerate(curls):
                     self._set_finger_curl(finger, float(c))
                 self._last_curls = curls.astype(np.float32)
+            if target_abd is not None and self._thumb_opp is not None:
+                a = float(np.clip(target_abd, 0.0, 1.0))
+                lo = max(self._thumb_opp.lower, _THUMB_ABD_MIN_RAD)
+                hi = min(self._thumb_opp.upper, _THUMB_ABD_MAX_RAD)
+                rad = lo + a * (hi - lo)
+                self._motor_target(self._thumb_opp, rad)
 
         async with self._lock:
             await asyncio.to_thread(_apply)

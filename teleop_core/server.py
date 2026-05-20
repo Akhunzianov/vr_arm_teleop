@@ -30,8 +30,8 @@ from aiohttp import WSMsgType, web
 
 from .calibration import FingerCalibrationFSM
 from .messages import (
-    AnchorMsg, ButtonMsg, HandStateMsg, PhaseMsg, PromptMsg, TriggerMsg,
-    WorkspaceMsg, decode, encode,
+    AnchorMsg, ButtonMsg, HandStateMsg, PhaseMsg, PromptMsg, RobotEchoMsg,
+    TriggerMsg, WorkspaceMsg, decode, encode,
 )
 from .point_cloud import PointCloudSource, encode_frame
 from .robot import RobotCommand, RobotDriver
@@ -216,6 +216,11 @@ class TeleopServer:
                 await ws.send_str(encode(PromptMsg(
                     text="Ready. Hold LEFT trigger to engage tracking.",
                 )))
+                # The client wants to draw a starting-ghost hand whose
+                # orientation and finger curls mirror the robot's current
+                # state, so the operator can align to the real arm before
+                # the first engage.
+                await self._send_robot_state(ws)
             else:
                 await ws.send_str(encode(PromptMsg(text=self._calib.current_prompt)))
 
@@ -283,6 +288,24 @@ class TeleopServer:
                 text="Held. Pull LEFT trigger to engage tracking again.",
             )))
 
+    async def _send_robot_state(self, ws: web.WebSocketResponse) -> None:
+        """Push a one-shot RobotEchoMsg with the current robot wrist + curls.
+
+        The client uses this to render the starting-ghost hand. Failures
+        are logged but non-fatal: the client falls back to identity.
+        """
+        try:
+            state = await self._robot.get_state()
+        except Exception as exc:
+            print(f"[teleop] get_state error: {exc!r}")
+            return
+        await ws.send_str(encode(RobotEchoMsg(
+            wrist_position=tuple(float(v) for v in state.wrist_pose.position),
+            wrist_orientation=tuple(float(v) for v in state.wrist_pose.orientation),
+            finger_curls=tuple(float(v) for v in state.finger_curls),
+            timestamp=float(state.timestamp),
+        )))
+
     def _latest_user_wrist_pose(self) -> Pose | None:
         """Build a Pose from the most recent HandStateMsg, or None if stale."""
         h = self._latest_hand
@@ -339,9 +362,11 @@ class TeleopServer:
         # raw values clamped to [0,1].
         raw_curls = np.asarray(self._latest_hand.curls, dtype=np.float32)
         curls = self._calib.record.apply_curl(raw_curls)
+        abd = self._calib.record.apply_abduction(float(self._latest_hand.abduction))
         cmd = RobotCommand(
             target_wrist_pose=result.target,
             target_finger_curls=curls,
+            target_thumb_abduction=abd,
             timestamp=time.monotonic(),
         )
         await self._robot.send(cmd)
