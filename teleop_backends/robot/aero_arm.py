@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import threading
 import time
 from typing import Optional
@@ -37,6 +36,10 @@ from scipy.spatial.transform import Rotation as R
 
 from teleop_core.robot import RobotCommand, RobotDriver, RobotState
 from teleop_core.types import Pose
+from .rc5_state import (
+    load_rc5_robot_api,
+    read_rc5_named_joint_angles,
+)
 
 
 # RC5 SDK path — override with RC5_API_PATH env var if the repo lives
@@ -66,6 +69,15 @@ def _rotvec_deg_to_quat(rotvec_deg: np.ndarray) -> np.ndarray:
 def _quat_to_rotvec_deg(quat_xyzw: np.ndarray) -> np.ndarray:
     """Quaternion (x, y, z, w) → rotation-vector in degrees."""
     return np.degrees(R.from_quat(quat_xyzw).as_rotvec())
+
+
+def _read_rc5_tcp_pose(robot) -> Pose | None:
+    cart = robot.motion.linear.get_actual_position(orientation_units="deg")
+    if cart is None:
+        return None
+    pos = np.asarray(cart[:3], dtype=np.float64)
+    orn = _rotvec_deg_to_quat(np.asarray(cart[3:], dtype=np.float64))
+    return Pose(position=pos, orientation=orn, frame="world")
 
 
 # ── Aero Hand mapping ─────────────────────────────────────────────────────────
@@ -140,10 +152,7 @@ class AeroArmDriver(RobotDriver):
 
         def _connect() -> None:
             # ── RC5 ──────────────────────────────────────────────────────────
-            if self._rc5_api_path not in sys.path:
-                sys.path.insert(0, self._rc5_api_path)
-
-            from API.rc_api import RobotApi  # noqa: PLC0415
+            RobotApi = load_rc5_robot_api(self._rc5_api_path)
             from API.source.models.classes.enum_classes.state_classes import (  # noqa: PLC0415
                 InComingControllerState as Ics,
                 InComingSafetyStatus    as Iss,
@@ -171,10 +180,10 @@ class AeroArmDriver(RobotDriver):
             self._hand = hand
 
             # ── Home pose from actual RC5 position ───────────────────────────
-            cart = robot.motion.linear.get_actual_position(orientation_units="deg")
-            if cart is not None:
-                pos = np.asarray(cart[:3], dtype=np.float64)
-                orn = _rotvec_deg_to_quat(np.asarray(cart[3:], dtype=np.float64))
+            pose = _read_rc5_tcp_pose(robot)
+            if pose is not None:
+                pos = pose.position
+                orn = pose.orientation
             else:
                 # Robot not responding at start — use the canonical home pose.
                 pos = np.asarray(_HOME_POS_M,   dtype=np.float64)
@@ -280,27 +289,27 @@ class AeroArmDriver(RobotDriver):
 
         def _read() -> RobotState:
             with self._arm_lock:
-                cart = self._robot.motion.linear.get_actual_position(
-                    orientation_units="deg"
-                )
-            if cart is not None:
-                pos = np.asarray(cart[:3], dtype=np.float64)
-                orn = _rotvec_deg_to_quat(np.asarray(cart[3:], dtype=np.float64))
+                pose = _read_rc5_tcp_pose(self._robot)
+                named_joints = read_rc5_named_joint_angles(self._robot)
+            if pose is not None:
+                wrist_pose = pose
             else:
                 # Robot temporarily unresponsive — echo the home pose so the
                 # safety monitor doesn't false-positive on stale state.
                 assert self._home_pose is not None
-                pos = self._home_pose.position
-                orn = self._home_pose.orientation
+                wrist_pose = self._home_pose
+            joint_names = tuple(named_joints)
+            joint_angles = np.asarray(
+                [named_joints[name] for name in joint_names],
+                dtype=np.float32,
+            )
 
             return RobotState(
-                wrist_pose=Pose(position=pos, orientation=orn, frame="world"),
-                # RC5 API doesn't expose joint angles over the Cartesian path;
-                # return zeros. The safety monitor only uses wrist_pose.
-                joint_angles=np.zeros(6, dtype=np.float32),
+                wrist_pose=wrist_pose,
+                joint_angles=joint_angles,
                 finger_curls=self._last_curls.copy(),
                 timestamp=time.monotonic(),
-                joint_names=(),
+                joint_names=joint_names,
             )
 
         return await asyncio.to_thread(_read)
