@@ -313,6 +313,7 @@ class TeleopServer:
                         right_wrist_orientation=decoded.wrist_orientation,
                         valid=decoded.head_valid and decoded.valid,
                         timestamp=time.monotonic(),
+                        right_wrist_curls=decoded.curls,
                     )
                 elif isinstance(decoded, ButtonMsg):
                     await self._on_button(ws, decoded)
