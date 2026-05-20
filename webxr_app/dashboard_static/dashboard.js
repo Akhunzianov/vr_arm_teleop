@@ -23,7 +23,17 @@ comms.onConnectionState = state => status.setConnectionState(state);
 comms.onJson = msg => {
   if (msg.type !== 'snapshot') return;
   if (!modelLoaded) {
-    robot.load(msg.model);
+    robot.load(msg.model, () => {
+      // Parent the cloud to the first camera with a URDF link (the wrist
+      // D405). When the arm moves, the cloud moves with it.
+      const feeds = (msg.model && msg.model.camera_feeds) || [];
+      const wristFeed = feeds.find(f => f.urdf_link);
+      if (wristFeed) {
+        const link = robot.findLink(wristFeed.urdf_link);
+        if (link) cloud.setLinkParent(link);
+        else console.warn('[dashboard] URDF link not found for cloud parent', wristFeed.urdf_link);
+      }
+    });
     workspace.setBounds(msg.workspace.min, msg.workspace.max);
     modelLoaded = true;
   }

@@ -82,7 +82,7 @@ export class RobotView {
     world.add(this.group);
   }
 
-  load(model) {
+  load(model, onReady) {
     const loader = new URDFLoader();
     loader.workingPath = model.urdf_assets_url;
     loader.load(model.urdf_url, robot => {
@@ -95,8 +95,15 @@ export class RobotView {
         }
       });
       this.group.add(robot);
-      this._attachCameraFeeds(model.camera_feeds || []);
+      // 2D camera feed planes intentionally disabled: the point cloud
+      // from the wrist camera carries the same info in 3D and the plane
+      // floating in front of the wrist was visually noisy.
+      if (onReady) onReady(robot);
     });
+  }
+
+  findLink(name) {
+    return this._findLink(name);
   }
 
   applyJoints(joints) {
