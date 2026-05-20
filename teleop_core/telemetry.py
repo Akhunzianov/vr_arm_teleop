@@ -1,0 +1,233 @@
+"""Shared read-only telemetry cache for teleop and dashboard clients."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from .point_cloud import PointCloudSource, encode_frame
+from .robot import RobotDriver, RobotState
+from .workspace import Workspace
+
+
+@dataclass(frozen=True)
+class EncodedPointCloud:
+    """Encoded point-cloud payload plus fanout metadata."""
+
+    sequence: int
+    payload: bytes
+    timestamp: float
+    n_points: int
+
+
+def _vec(values) -> list[float]:
+    return [float(v) for v in values]
+
+
+def _pose_dict(position, orientation, timestamp: float) -> dict[str, Any]:
+    return {
+        "position": _vec(position),
+        "orientation": _vec(orientation),
+        "timestamp": float(timestamp),
+    }
+
+
+class TelemetryHub:
+    """Caches live setup telemetry and fans it out to read-only clients."""
+
+    def __init__(
+        self,
+        *,
+        point_cloud_source: PointCloudSource,
+        robot_driver: RobotDriver,
+        workspace: Workspace,
+        urdf_url: str,
+        urdf_assets_url: str,
+        pointcloud_hz: float = 15.0,
+        robot_hz: float = 30.0,
+        status_hz: float = 1.0,
+    ) -> None:
+        self._pc = point_cloud_source
+        self._robot = robot_driver
+        self._workspace = workspace
+        self._urdf_url = urdf_url
+        self._urdf_assets_url = urdf_assets_url
+        self._pointcloud_hz = float(pointcloud_hz)
+        self._robot_hz = float(robot_hz)
+        self._status_hz = float(status_hz)
+        self._robot_state: RobotState | None = None
+        self._robot_error: str | None = None
+        self._pointcloud: EncodedPointCloud | None = None
+        self._pointcloud_error: str | None = None
+        self._pointcloud_sequence = 0
+        self._cloud_condition = asyncio.Condition()
+        self._xr_pose: dict[str, Any] | None = None
+        self._anchor: dict[str, Any] | None = None
+        self._tasks: list[asyncio.Task] = []
+        self._stopping = False
+
+    async def start(self) -> None:
+        if self._tasks:
+            return
+        self._stopping = False
+        self._tasks = [
+            asyncio.create_task(self._robot_loop(), name="telemetry_robot_loop"),
+            asyncio.create_task(
+                self._pointcloud_loop(),
+                name="telemetry_pointcloud_loop",
+            ),
+        ]
+
+    async def stop(self) -> None:
+        self._stopping = True
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._tasks = []
+
+    async def sample_robot_once(self) -> None:
+        try:
+            self._robot_state = await self._robot.get_state()
+            self._robot_error = None
+        except Exception as exc:
+            self._robot_error = repr(exc)
+
+    async def sample_pointcloud_once(self) -> None:
+        try:
+            frame = await self._pc.grab()
+            self._pointcloud_error = None
+        except Exception as exc:
+            frame = None
+            self._pointcloud_error = repr(exc)
+        if frame is None:
+            return
+        payload = encode_frame(frame)
+        async with self._cloud_condition:
+            self._pointcloud_sequence += 1
+            self._pointcloud = EncodedPointCloud(
+                sequence=self._pointcloud_sequence,
+                payload=payload,
+                timestamp=float(frame.timestamp),
+                n_points=int(frame.n_points),
+            )
+            self._cloud_condition.notify_all()
+
+    async def wait_for_pointcloud(
+        self,
+        *,
+        after_sequence: int,
+        timeout: float,
+    ) -> EncodedPointCloud | None:
+        async with self._cloud_condition:
+            if (
+                self._pointcloud is not None
+                and self._pointcloud.sequence > after_sequence
+            ):
+                return self._pointcloud
+            try:
+                await asyncio.wait_for(
+                    self._cloud_condition.wait_for(
+                        lambda: (
+                            self._pointcloud is not None
+                            and self._pointcloud.sequence > after_sequence
+                        )
+                    ),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return None
+            return self._pointcloud
+
+    def update_xr_pose(
+        self,
+        *,
+        head_position,
+        head_orientation,
+        right_wrist_position,
+        right_wrist_orientation,
+        valid: bool,
+        timestamp: float,
+    ) -> None:
+        if not valid:
+            self._xr_pose = None
+            return
+        self._xr_pose = {
+            "head": _pose_dict(head_position, head_orientation, timestamp),
+            "right_wrist": _pose_dict(
+                right_wrist_position,
+                right_wrist_orientation,
+                timestamp,
+            ),
+        }
+
+    def update_anchor(self, vr_position_of_robot_origin, *, timestamp: float) -> None:
+        self._anchor = {
+            "vr_position_of_robot_origin": _vec(vr_position_of_robot_origin),
+            "timestamp": float(timestamp),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        robot = self._robot_state
+        cloud = self._pointcloud
+        return {
+            "type": "snapshot",
+            "model": {
+                "urdf_url": self._urdf_url,
+                "urdf_assets_url": self._urdf_assets_url,
+            },
+            "workspace": {
+                "min": _vec(self._workspace.min_corner),
+                "max": _vec(self._workspace.max_corner),
+                "frame": self._workspace.frame,
+            },
+            "robot": {
+                "wrist": None if robot is None else _pose_dict(
+                    robot.wrist_pose.position,
+                    robot.wrist_pose.orientation,
+                    robot.timestamp,
+                ),
+                "joints": {} if robot is None else robot.named_joint_angles,
+                "finger_curls": [] if robot is None else _vec(robot.finger_curls),
+                "timestamp": None if robot is None else float(robot.timestamp),
+                "error": self._robot_error,
+            },
+            "pointcloud": {
+                "sequence": 0 if cloud is None else int(cloud.sequence),
+                "timestamp": None if cloud is None else float(cloud.timestamp),
+                "n_points": 0 if cloud is None else int(cloud.n_points),
+                "error": self._pointcloud_error,
+            },
+            "xr": {
+                "aligned": self._xr_pose is not None and self._anchor is not None,
+                "anchor": self._anchor,
+                "head": None if self._xr_pose is None else self._xr_pose["head"],
+                "right_wrist": (
+                    None if self._xr_pose is None else self._xr_pose["right_wrist"]
+                ),
+            },
+            "status": {
+                "server_time": time.monotonic(),
+                "robot_hz": self._robot_hz,
+                "pointcloud_hz": self._pointcloud_hz,
+                "status_hz": self._status_hz,
+            },
+        }
+
+    async def _robot_loop(self) -> None:
+        period = 1.0 / max(self._robot_hz, 1e-3)
+        while not self._stopping:
+            start = time.monotonic()
+            await self.sample_robot_once()
+            await asyncio.sleep(max(0.0, period - (time.monotonic() - start)))
+
+    async def _pointcloud_loop(self) -> None:
+        period = 1.0 / max(self._pointcloud_hz, 1e-3)
+        while not self._stopping:
+            start = time.monotonic()
+            await self.sample_pointcloud_once()
+            await asyncio.sleep(max(0.0, period - (time.monotonic() - start)))

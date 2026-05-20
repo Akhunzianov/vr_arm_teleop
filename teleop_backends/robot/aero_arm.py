@@ -300,6 +300,7 @@ class AeroArmDriver(RobotDriver):
                 joint_angles=np.zeros(6, dtype=np.float32),
                 finger_curls=self._last_curls.copy(),
                 timestamp=time.monotonic(),
+                joint_names=(),
             )
 
         return await asyncio.to_thread(_read)

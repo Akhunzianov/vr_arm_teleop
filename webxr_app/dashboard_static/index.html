@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VR setup dashboard</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "three/examples/jsm/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "urdf-loader": "https://cdn.jsdelivr.net/npm/urdf-loader@0.12.6/src/URDFLoader.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <main id="app">
+    <section id="viewport"></section>
+    <aside id="panel">
+      <div class="panel-section">
+        <h1>Setup Dashboard</h1>
+        <div id="connection">Connecting</div>
+      </div>
+      <div class="panel-section">
+        <h2>Layers</h2>
+        <label><input id="toggle-robot" type="checkbox" checked> Robot</label>
+        <label><input id="toggle-cloud" type="checkbox" checked> Point cloud</label>
+        <label><input id="toggle-workspace" type="checkbox" checked> Workspace</label>
+        <label><input id="toggle-xr" type="checkbox" checked> XR head/wrist</label>
+      </div>
+      <div id="status"></div>
+    </aside>
+  </main>
+  <script type="module" src="./dashboard.js"></script>
+</body>
+</html>

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,9 +34,10 @@ from .messages import (
     AnchorMsg, ButtonMsg, HandStateMsg, PhaseMsg, PromptMsg, RobotEchoMsg,
     TriggerMsg, WorkspaceMsg, decode, encode,
 )
-from .point_cloud import PointCloudSource, encode_frame
+from .point_cloud import PointCloudSource
 from .robot import RobotCommand, RobotDriver
 from .safety import SafetyConfig, SafetyMonitor
+from .telemetry import TelemetryHub
 from .tracking import CartesianTracker
 from .types import Pose
 from .workspace import Workspace
@@ -50,12 +52,27 @@ class ServerConfig:
     """Static configuration that doesn't change per-connection."""
     host: str = "0.0.0.0"
     port: int = 8000
+    dashboard_port: int = 8001
     static_dir: Path = Path(__file__).parent.parent / "webxr_app" / "static"
+    dashboard_static_dir: Path = (
+        Path(__file__).parent.parent / "webxr_app" / "dashboard_static"
+    )
     cert: Path | None = None
     key: Path | None = None
+    urdf_path: Path | None = None
+    robot_assets_root: Path | None = None
     command_hz: float = 50.0
     pointcloud_hz: float = 15.0
     safety_hz: float = 30.0
+    dashboard_robot_hz: float = 30.0
+    dashboard_status_hz: float = 1.0
+
+
+def _resolve_robot_asset_path(root: Path, tail: str) -> Path:
+    root_resolved = Path(root).resolve()
+    target = (root_resolved / tail).resolve()
+    target.relative_to(root_resolved)
+    return target
 
 
 class TeleopServer:
@@ -80,12 +97,65 @@ class TeleopServer:
         self._latest_hand = HandStateMsg()
         self._shutdown = asyncio.Event()
         self._last_debug_print = 0.0
+        self._telemetry = TelemetryHub(
+            point_cloud_source=self._pc,
+            robot_driver=self._robot,
+            workspace=self._workspace,
+            urdf_url="/robot/robot.urdf",
+            urdf_assets_url="/robot/assets/",
+            pointcloud_hz=self._config.pointcloud_hz,
+            robot_hz=self._config.dashboard_robot_hz,
+            status_hz=self._config.dashboard_status_hz,
+        )
 
     async def run(self) -> None:
         """Start backends, start aiohttp, block until shutdown."""
         await self._pc.start()
         await self._robot.start()
+        await self._telemetry.start()
 
+        teleop_app = self._make_teleop_app()
+        dashboard_app = self._make_dashboard_app()
+        teleop_runner = web.AppRunner(teleop_app)
+        dashboard_runner = web.AppRunner(dashboard_app)
+        await teleop_runner.setup()
+        await dashboard_runner.setup()
+
+        ssl_context = None
+        if self._config.cert and self._config.key:
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(self._config.cert, self._config.key)
+
+        teleop_site = web.TCPSite(
+            teleop_runner,
+            self._config.host,
+            self._config.port,
+            ssl_context=ssl_context,
+        )
+        dashboard_site = web.TCPSite(
+            dashboard_runner,
+            self._config.host,
+            self._config.dashboard_port,
+            ssl_context=ssl_context,
+        )
+        try:
+            await teleop_site.start()
+            await dashboard_site.start()
+            scheme = "https" if ssl_context else "http"
+            print(f"[teleop] serving on {scheme}://{self._config.host}:{self._config.port}")
+            print(
+                f"[teleop] dashboard on "
+                f"{scheme}://{self._config.host}:{self._config.dashboard_port}"
+            )
+            await self._shutdown.wait()
+        finally:
+            await dashboard_runner.cleanup()
+            await teleop_runner.cleanup()
+            await self._telemetry.stop()
+            await self._pc.stop()
+            await self._robot.stop()
+
+    def _make_teleop_app(self) -> web.Application:
         static_dir = Path(self._config.static_dir)
         app = web.Application()
         app.router.add_get("/ws", self._handle_ws)
@@ -96,27 +166,93 @@ class TeleopServer:
             lambda _req: web.FileResponse(static_dir / "index.html"),
         )
         app.router.add_static("/", path=str(static_dir), show_index=False)
+        return app
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-
-        ssl_context = None
-        if self._config.cert and self._config.key:
-            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            ssl_context.load_cert_chain(self._config.cert, self._config.key)
-
-        site = web.TCPSite(
-            runner, self._config.host, self._config.port, ssl_context=ssl_context,
+    def _make_dashboard_app(self) -> web.Application:
+        static_dir = Path(self._config.dashboard_static_dir)
+        app = web.Application()
+        app.router.add_get("/ws", self._handle_dashboard_ws)
+        app.router.add_get("/api/snapshot", self._handle_dashboard_snapshot)
+        app.router.add_get("/robot/robot.urdf", self._handle_robot_urdf)
+        app.router.add_get("/robot/assets/{tail:.*}", self._handle_robot_asset)
+        app.router.add_get(
+            "/",
+            lambda _req: web.FileResponse(static_dir / "index.html"),
         )
+        app.router.add_static("/", path=str(static_dir), show_index=False)
+        return app
+
+    async def _handle_dashboard_snapshot(self, _request) -> web.Response:
+        return web.json_response(self._telemetry.snapshot())
+
+    async def _handle_robot_urdf(self, _request) -> web.StreamResponse:
+        if self._config.urdf_path is None:
+            return web.Response(status=404, text="URDF not configured")
+        return web.FileResponse(Path(self._config.urdf_path))
+
+    async def _handle_robot_asset(self, request) -> web.StreamResponse:
+        root = self._config.robot_assets_root
+        if root is None:
+            return web.Response(status=404, text="robot asset root not configured")
         try:
-            await site.start()
-            scheme = "https" if ssl_context else "http"
-            print(f"[teleop] serving on {scheme}://{self._config.host}:{self._config.port}")
-            await self._shutdown.wait()
+            path = _resolve_robot_asset_path(Path(root), request.match_info["tail"])
+        except ValueError:
+            return web.Response(status=404)
+        if not path.exists() or not path.is_file():
+            return web.Response(status=404)
+        return web.FileResponse(path)
+
+    async def _handle_dashboard_ws(self, request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str(json.dumps(self._telemetry.snapshot()))
+
+        async def json_loop() -> None:
+            # Snapshot JSON is small and carries robot/XR state, so send it at
+            # the dashboard robot rate.
+            period = 1.0 / max(self._config.dashboard_robot_hz, 1e-3)
+            while not ws.closed:
+                try:
+                    await ws.send_str(json.dumps(self._telemetry.snapshot()))
+                except ConnectionResetError:
+                    break
+                await asyncio.sleep(period)
+
+        async def cloud_loop() -> None:
+            last_sequence = 0
+            while not ws.closed:
+                cloud = await self._telemetry.wait_for_pointcloud(
+                    after_sequence=last_sequence,
+                    timeout=1.0,
+                )
+                if cloud is None:
+                    continue
+                last_sequence = cloud.sequence
+                try:
+                    await ws.send_bytes(cloud.payload)
+                except ConnectionResetError:
+                    break
+
+        tasks = [
+            asyncio.create_task(json_loop(), name="dashboard_json_loop"),
+            asyncio.create_task(cloud_loop(), name="dashboard_cloud_loop"),
+        ]
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.ERROR:
+                    break
+                if msg.type == WSMsgType.TEXT:
+                    await ws.send_str(json.dumps({
+                        "type": "error",
+                        "message": "dashboard is read-only",
+                    }))
         finally:
-            await runner.cleanup()
-            await self._pc.stop()
-            await self._robot.stop()
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        return ws
 
     # ----- inbound channels -----
 
@@ -170,6 +306,14 @@ class TeleopServer:
                     continue
                 if isinstance(decoded, HandStateMsg):
                     self._latest_hand = decoded
+                    self._telemetry.update_xr_pose(
+                        head_position=decoded.head_position,
+                        head_orientation=decoded.head_orientation,
+                        right_wrist_position=decoded.wrist_position,
+                        right_wrist_orientation=decoded.wrist_orientation,
+                        valid=decoded.head_valid and decoded.valid,
+                        timestamp=time.monotonic(),
+                    )
                 elif isinstance(decoded, ButtonMsg):
                     await self._on_button(ws, decoded)
                 elif isinstance(decoded, TriggerMsg):
@@ -263,6 +407,10 @@ class TeleopServer:
             rp = np.asarray(robot_state.wrist_pose.position, dtype=np.float64)  # robot frame
             robot_anchor_in_helmet = np.array([rp[0], rp[2], -rp[1]], dtype=np.float64)
             vr_origin = (user_pos - robot_anchor_in_helmet).tolist()
+            self._telemetry.update_anchor(
+                (float(vr_origin[0]), float(vr_origin[1]), float(vr_origin[2])),
+                timestamp=time.monotonic(),
+            )
             await ws.send_str(encode(AnchorMsg(
                 vr_position_of_robot_origin=(
                     float(vr_origin[0]), float(vr_origin[1]), float(vr_origin[2]),
@@ -372,23 +520,20 @@ class TeleopServer:
         await self._robot.send(cmd)
 
     async def _pointcloud_loop(self, ws: web.WebSocketResponse) -> None:
-        """At pointcloud_hz: grab a frame, encode, send binary."""
-        period = 1.0 / max(self._config.pointcloud_hz, 1e-3)
-        loop = asyncio.get_running_loop()
+        """Send cached point-cloud frames from the shared telemetry hub."""
+        last_sequence = 0
         while not ws.closed:
-            t0 = loop.time()
+            cloud = await self._telemetry.wait_for_pointcloud(
+                after_sequence=last_sequence,
+                timeout=1.0,
+            )
+            if cloud is None:
+                continue
+            last_sequence = cloud.sequence
             try:
-                frame = await self._pc.grab()
-            except Exception as exc:
-                print(f"[teleop] pc grab error: {exc!r}")
-                frame = None
-            if frame is not None:
-                try:
-                    await ws.send_bytes(encode_frame(frame))
-                except ConnectionResetError:
-                    break
-            elapsed = loop.time() - t0
-            await asyncio.sleep(max(0.0, period - elapsed))
+                await ws.send_bytes(cloud.payload)
+            except ConnectionResetError:
+                break
 
     async def _safety_loop(self, ws) -> None:
         """At safety_hz: run SafetyMonitor; broadcast events to client."""

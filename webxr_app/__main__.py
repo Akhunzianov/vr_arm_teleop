@@ -25,9 +25,22 @@ from teleop_backends.pointcloud import (
     HardwarePointCloudSource, MockPointCloudSource, MultiRealSenseSource,
     PybulletPointCloudSource,
 )
-from teleop_backends.robot import (
-    AeroArmDriver, FloatingWristDriver, NoopRobotDriver, PybulletRobotDriver,
-)
+
+
+def _default_full_urdf() -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "urdf_rc5_right_hand"
+        / "urdf_with_simple_collisions.urdf"
+    )
+
+
+def _default_floating_urdf() -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "urdf_rc5_right_hand"
+        / "robot_one_joint.urdf"
+    )
 
 
 def _make_pc_source(name: str, args: argparse.Namespace):
@@ -50,14 +63,15 @@ def _make_pc_source(name: str, args: argparse.Namespace):
 def _make_robot_driver(name: str, args: argparse.Namespace):
     """Resolve --robot-backend into a RobotDriver instance."""
     if name == "noop":
+        from teleop_backends.robot import NoopRobotDriver
         return NoopRobotDriver(home=Pose.identity(frame="world"))
     if name == "pybullet":
+        from teleop_backends.robot import PybulletRobotDriver
         urdf = args.urdf
         if urdf is None:
             # Canonical full robot model: arm + prehand D405 + right hand,
             # with simplified collisions for stable PyBullet simulation.
-            urdf = Path(__file__).resolve().parent.parent / "urdf_rc5_right_hand" \
-                / "urdf_with_simple_collisions.urdf"
+            urdf = _default_full_urdf()
         home_q = None
         if args.home_joints is not None:
             home_q = tuple(float(s) for s in args.home_joints.split(","))
@@ -67,12 +81,13 @@ def _make_robot_driver(name: str, args: argparse.Namespace):
             urdf_path=urdf, gui=args.pybullet_gui, home_joint_angles=home_q,
         )
     if name == "floating":
+        from teleop_backends.robot import FloatingWristDriver
         urdf = args.urdf
         if urdf is None:
-            urdf = Path(__file__).resolve().parent.parent / "urdf_rc5_right_hand" \
-                / "robot_one_joint.urdf"
+            urdf = _default_floating_urdf()
         return FloatingWristDriver(urdf_path=urdf, gui=args.pybullet_gui)
     if name == "aero":
+        from teleop_backends.robot import AeroArmDriver
         return AeroArmDriver(
             arm_ip=args.arm_ip,
             aero_port=args.aero_port,
@@ -140,6 +155,7 @@ def _parse_args() -> argparse.Namespace:
 
     # Networking + TLS:
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--dashboard-port", type=int, default=8001)
     ap.add_argument("--cert", type=Path, default=None)
     ap.add_argument("--key", type=Path, default=None)
 
@@ -152,6 +168,11 @@ def _parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = _parse_args()
+    urdf_for_dashboard = args.urdf or (
+        _default_floating_urdf()
+        if args.robot_backend == "floating"
+        else _default_full_urdf()
+    )
     pc_source = _make_pc_source(args.pc_backend, args)
     robot = _make_robot_driver(args.robot_backend, args)
     # Start the robot first so its home_pose is available for the workspace
@@ -170,7 +191,14 @@ async def main() -> None:
         point_cloud_source=pc_source,
         robot_driver=robot,
         workspace=workspace,
-        config=ServerConfig(port=args.port, cert=args.cert, key=args.key),
+        config=ServerConfig(
+            port=args.port,
+            dashboard_port=args.dashboard_port,
+            cert=args.cert,
+            key=args.key,
+            urdf_path=urdf_for_dashboard,
+            robot_assets_root=urdf_for_dashboard.parent,
+        ),
         safety_config=SafetyConfig(),
     )
     await server.run()

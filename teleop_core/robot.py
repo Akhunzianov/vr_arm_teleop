@@ -32,6 +32,17 @@ class RobotState:
     joint_angles: np.ndarray  # all joint angles (radians), for logging
     finger_curls: np.ndarray  # (5,) normalized 0..1; for HUD echo
     timestamp: float          # time.monotonic() seconds
+    joint_names: tuple[str, ...] = ()
+
+    @property
+    def named_joint_angles(self) -> dict[str, float]:
+        """Return URDF-name keyed joint angles when a driver provides names."""
+        if len(self.joint_names) != int(self.joint_angles.shape[0]):
+            return {}
+        return {
+            name: float(angle)
+            for name, angle in zip(self.joint_names, self.joint_angles)
+        }
 
 
 @dataclass(frozen=True)

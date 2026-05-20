@@ -18,6 +18,7 @@ from .point_cloud import PointCloudFrame, PointCloudSource, encode_frame
 from .robot import RobotCommand, RobotDriver, RobotState
 from .safety import SafetyConfig, SafetyEvent, SafetyKind, SafetyMonitor, Severity
 from .server import ServerConfig, TeleopServer
+from .telemetry import EncodedPointCloud, TelemetryHub
 from .tracking import CartesianTracker, TrackingResult, WristAnchor
 from .types import Pose, Vec3
 from .workspace import Workspace
@@ -29,6 +30,7 @@ __all__ = [
     "RobotCommand", "RobotDriver", "RobotState",
     "SafetyConfig", "SafetyEvent", "SafetyKind", "SafetyMonitor", "Severity",
     "ServerConfig", "TeleopServer",
+    "EncodedPointCloud", "TelemetryHub",
     "CartesianTracker", "TrackingResult", "WristAnchor",
     "Pose", "Vec3",
     "Workspace",

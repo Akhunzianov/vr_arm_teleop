@@ -103,6 +103,15 @@ On the Quest browser, open `https://<your-LAN-ip>:8000`, accept the
 self-signed cert warning, tap **Enter VR**. You should see an animated
 point cloud and a workspace wireframe in front of you.
 
+### Setup dashboard
+
+The server also starts a read-only desktop dashboard on
+`http://<host>:8001` by default. It renders the configured URDF,
+the fused point cloud, workspace bounds, and Quest head/right-wrist
+markers after the operator engages tracking once. The dashboard is
+observability-only in v1: it does not write config files or command
+robot motion.
+
 ### Wired alternative (no cert needed)
 
 ```bash
@@ -142,6 +151,7 @@ python -m webxr_app --pc-backend mock --robot-backend pybullet
 | `--cameras` | – | camera config JSON for `--pc-backend hardware` or `realsense` |
 | `--workspace` | derived from home | `workspace.json` with `{"min":[x,y,z],"max":[x,y,z]}` |
 | `--port` | `8000` | HTTP/HTTPS port |
+| `--dashboard-port` | `8001` | Read-only desktop setup dashboard port |
 | `--cert` / `--key` | – | TLS cert + key (required for non-localhost Quest) |
 
 ### Hardware camera config

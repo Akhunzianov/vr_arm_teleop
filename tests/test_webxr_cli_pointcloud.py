@@ -1,14 +1,13 @@
 import argparse
 import json
 import sys
-import types
 
 import pytest
 
-sys.modules.setdefault("pybullet", types.SimpleNamespace())
-
 from teleop_backends.pointcloud.hardware import HardwarePointCloudSource
-from webxr_app.__main__ import _make_pc_source
+from teleop_backends.robot import NoopRobotDriver
+from teleop_core.server import ServerConfig
+from webxr_app.__main__ import _make_pc_source, _make_robot_driver
 
 
 def _write_config(tmp_path):
@@ -51,3 +50,33 @@ def test_realsense_pc_backend_uses_legacy_realsense_wrapper(tmp_path):
     source = _make_pc_source("realsense", args)
 
     assert isinstance(source, HardwarePointCloudSource)
+
+
+def test_server_config_has_dashboard_port_default():
+    config = ServerConfig()
+
+    assert config.port == 8000
+    assert config.dashboard_port == 8001
+
+
+def test_parse_args_accepts_dashboard_port(monkeypatch):
+    from webxr_app.__main__ import _parse_args
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["webxr_app", "--dashboard-port", "9001"],
+    )
+
+    args = _parse_args()
+
+    assert args.dashboard_port == 9001
+
+
+def test_noop_robot_backend_does_not_require_pybullet(monkeypatch):
+    monkeypatch.delitem(sys.modules, "pybullet", raising=False)
+    args = argparse.Namespace()
+
+    robot = _make_robot_driver("noop", args)
+
+    assert isinstance(robot, NoopRobotDriver)

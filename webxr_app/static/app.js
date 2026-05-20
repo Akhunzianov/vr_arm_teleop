@@ -181,6 +181,26 @@ scene.setAnimationLoop((time, frame) => {
   const ref = scene.renderer.xr.getReferenceSpace();
   if (!ref) return;
 
+  const viewerPose = frame.getViewerPose ? frame.getViewerPose(ref) : null;
+  const head = viewerPose && viewerPose.transform ? {
+    position: [
+      viewerPose.transform.position.x,
+      viewerPose.transform.position.y,
+      viewerPose.transform.position.z,
+    ],
+    orientation: [
+      viewerPose.transform.orientation.x,
+      viewerPose.transform.orientation.y,
+      viewerPose.transform.orientation.z,
+      viewerPose.transform.orientation.w,
+    ],
+    valid: true,
+  } : {
+    position: [0, 0, 0],
+    orientation: [0, 0, 0, 1],
+    valid: false,
+  };
+
   const snap = input.read(frame, ref);
   rightHandView.update(snap.hands.right);
   leftCtrlView.update(snap.ctrls.left);
@@ -213,6 +233,9 @@ scene.setAnimationLoop((time, frame) => {
       wrist_position: right.wrist || [0, 0, 0],
       wrist_orientation: right.wristOrientation || [0, 0, 0, 1],
       valid: right.valid,
+      head_position: head.position,
+      head_orientation: head.orientation,
+      head_valid: head.valid,
     });
   }
 
