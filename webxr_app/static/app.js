@@ -117,7 +117,7 @@ const Q_ROB_TO_HEL = [-Math.SQRT1_2, 0, 0, Math.SQRT1_2];
 // (fingers +Y, palm -Z). Applied on the right so the resulting quat lives
 // in the same convention as the live WebXR wrist sample, letting HandView's
 // existing offsetQuaternion work unchanged for the ghost.
-const Q_URDF_TO_WEBXR_WRIST = [0, -Math.SQRT1_2, Math.SQRT1_2, 0];
+const Q_URDF_TO_WEBXR_WRIST = [Math.SQRT1_2, 0, 0, Math.SQRT1_2];
 function quatMul(a, b) {
   return [
     a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],

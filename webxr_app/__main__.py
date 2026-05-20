@@ -69,7 +69,12 @@ def _make_robot_driver(name: str, args: argparse.Namespace):
                 / "robot_one_joint.urdf"
         return FloatingWristDriver(urdf_path=urdf, gui=args.pybullet_gui)
     if name == "aero":
-        raise SystemExit("robot-backend 'aero' not implemented (punchlist 8)")
+        return AeroArmDriver(
+            arm_ip=args.arm_ip,
+            aero_port=args.aero_port,
+            arm_speed=args.arm_speed,
+            arm_accel=args.arm_accel,
+        )
     raise SystemExit(f"unknown robot-backend: {name!r}")
 
 
@@ -112,8 +117,14 @@ def _parse_args() -> argparse.Namespace:
     # Backend-specific knobs:
     ap.add_argument("--cameras", type=Path, default=None,
                     help="cameras.json for --pc-backend realsense")
+    ap.add_argument("--arm-ip", default="10.10.10.10",
+                    help="RC5 IP address for --robot-backend aero (default 10.10.10.10)")
     ap.add_argument("--aero-port", default=None,
-                    help="Serial port for --robot-backend aero")
+                    help="Serial port for --robot-backend aero (auto-detect if omitted)")
+    ap.add_argument("--arm-speed", type=float, default=0.1,
+                    help="RC5 waypoint speed m/s (default 0.1)")
+    ap.add_argument("--arm-accel", type=float, default=0.1,
+                    help="RC5 waypoint acceleration m/s² (default 0.1)")
     ap.add_argument("--urdf", type=Path, default=None,
                     help="Robot URDF for the pybullet driver")
     ap.add_argument("--pybullet-gui", action="store_true",
