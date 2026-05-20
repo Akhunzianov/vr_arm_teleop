@@ -152,17 +152,21 @@ class TelemetryHub:
         right_wrist_orientation,
         valid: bool,
         timestamp: float,
+        right_wrist_curls=None,
     ) -> None:
         if not valid:
             self._xr_pose = None
             return
+        right_wrist = _pose_dict(
+            right_wrist_position,
+            right_wrist_orientation,
+            timestamp,
+        )
+        if right_wrist_curls is not None:
+            right_wrist["curls"] = _vec(right_wrist_curls)
         self._xr_pose = {
             "head": _pose_dict(head_position, head_orientation, timestamp),
-            "right_wrist": _pose_dict(
-                right_wrist_position,
-                right_wrist_orientation,
-                timestamp,
-            ),
+            "right_wrist": right_wrist,
         }
 
     def update_anchor(self, vr_position_of_robot_origin, *, timestamp: float) -> None:
