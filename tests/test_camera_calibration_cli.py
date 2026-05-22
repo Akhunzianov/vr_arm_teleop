@@ -36,6 +36,14 @@ def test_calibration_cli_parses_config_driven_options():
             "24",
             "--stability-seconds",
             "1.5",
+            "--min-depth-corners",
+            "9",
+            "--max-kabsch-rms",
+            "0.006",
+            "--depth-neighborhood",
+            "2",
+            "--max-arm-motion-per-sample",
+            "0.004",
             "--no-autosave",
         ]
     )
@@ -50,6 +58,10 @@ def test_calibration_cli_parses_config_driven_options():
     assert args.dashboard_port == 9001
     assert args.rolling_window == 24
     assert args.stability_seconds == 1.5
+    assert args.min_depth_corners == 9
+    assert args.max_kabsch_rms == 0.006
+    assert args.depth_neighborhood == 2
+    assert args.max_arm_motion_per_sample == 0.004
     assert args.autosave is False
 
 

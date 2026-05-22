@@ -11,6 +11,7 @@ from teleop_core.server import _resolve_robot_asset_path
 from teleop_core.telemetry import TelemetryHub
 from teleop_core.types import Pose
 from teleop_core.workspace import Workspace
+from scripts.calibrate_two_cameras_charuco import _make_dashboard_app
 
 
 def test_robot_state_named_joint_angles_pairs_names_with_values():
@@ -280,6 +281,41 @@ def test_dashboard_snapshot_can_carry_calibration_status_and_world_cloud_mode():
     assert snap["calibration"]["mode"] == "continuous_calibration"
     assert snap["calibration"]["anchor_camera"] == "d405"
     assert snap["calibration"]["targets"]["d435i"]["accepted_samples"] == 2
+
+
+def test_calibration_dashboard_serves_detection_overlay_jpeg(tmp_path):
+    class FakeHub:
+        def snapshot(self):
+            return {"type": "snapshot"}
+
+        async def wait_for_pointcloud(self, *, after_sequence, timeout):
+            return None
+
+    class FakeCalibrationSource:
+        def latest_color_jpeg(self, camera_name):
+            return None
+
+        def latest_calibration_jpeg(self, camera_name):
+            assert camera_name == "d405"
+            return b"fake-jpeg"
+
+    urdf = tmp_path / "robot.urdf"
+    urdf.write_text("<robot name='test'/>")
+    app = _make_dashboard_app(
+        hub=FakeHub(),
+        source=FakeCalibrationSource(),
+        static_dir=Path(__file__).resolve().parents[1] / "webxr_app" / "dashboard_static",
+        urdf_path=urdf,
+        robot_assets_root=tmp_path,
+    )
+
+    routes = {
+        route.resource.canonical
+        for route in app.router.routes()
+        if route.resource is not None
+    }
+
+    assert "/api/cameras/{name}/calibration.jpg" in routes
 
 
 def test_resolve_robot_asset_path_allows_assets_under_root(tmp_path):

@@ -107,6 +107,11 @@ input[type="checkbox"] {
   font-size: 13px;
 }
 
+#calibration-feeds {
+  display: grid;
+  gap: 12px;
+}
+
 .status-group {
   display: grid;
   gap: 7px;
@@ -137,6 +142,51 @@ input[type="checkbox"] {
 
 .status-value.error {
   color: #ff9a8e;
+}
+
+.calibration-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.calibration-card {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid #26313a;
+}
+
+.calibration-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: #edf2f5;
+  font-size: 13px;
+}
+
+.calibration-card-head .ok {
+  color: #78e0a5;
+}
+
+.calibration-card-head .warn {
+  color: #ffd27a;
+}
+
+.calibration-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  border: 1px solid #26313a;
+  background: #07090b;
+}
+
+.calibration-card-metrics {
+  color: #aeb8c1;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {

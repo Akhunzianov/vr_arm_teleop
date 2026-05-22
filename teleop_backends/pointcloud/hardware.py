@@ -63,6 +63,17 @@ class HardwarePointCloudConfig:
         return tuple(camera.name for camera in self.cameras if not camera.calibrated)
 
 
+@dataclass(frozen=True)
+class CalibrationCameraFrame:
+    """RGB-D frame used by camera calibration diagnostics and depth fitting."""
+
+    image_rgb: np.ndarray
+    depth_meters: np.ndarray
+    descriptor: CameraDescriptor
+    timestamp: float | None = None
+    frame_number: int | None = None
+
+
 class CameraPointCloudReader(abc.ABC):
     """Backend-local interface for one hardware camera."""
 
@@ -84,6 +95,10 @@ class CameraPointCloudReader(abc.ABC):
 
     def latest_color_rgb(self) -> np.ndarray | None:
         """Return the latest RGB color frame, if available."""
+        return None
+
+    def latest_calibration_frame(self) -> CalibrationCameraFrame | None:
+        """Return the latest depth-aligned RGB-D frame for calibration."""
         return None
 
     def descriptor(self) -> CameraDescriptor | None:
@@ -394,6 +409,10 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         self._pointcloud = None
         self._latest_color_jpeg: bytes | None = None
         self._latest_color_rgb: np.ndarray | None = None
+        self._latest_depth_meters: np.ndarray | None = None
+        self._latest_frame_timestamp: float | None = None
+        self._latest_frame_number: int | None = None
+        self._depth_scale = 0.001
 
     async def start(self) -> None:
         try:
@@ -429,6 +448,12 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         self._pipeline = pipeline
         self._align = rs.align(rs.stream.color)
         self._pointcloud = rs.pointcloud()
+        try:
+            self._depth_scale = float(
+                self._profile.get_device().first_depth_sensor().get_depth_scale()
+            )
+        except Exception:
+            self._depth_scale = 0.001
 
     async def stop(self) -> None:
         pipeline = self._pipeline
@@ -455,8 +480,12 @@ class RealSensePointCloudReader(CameraPointCloudReader):
         points_obj = self._pointcloud.calculate(depth)
         vertices = np.asanyarray(points_obj.get_vertices()).view(np.float32).reshape(-1, 3)
         color_image = np.asanyarray(color.get_data())
+        depth_image = np.asanyarray(depth.get_data()).astype(np.float32) * float(self._depth_scale)
         self._latest_color_rgb = color_image.copy()
         self._latest_color_jpeg = _encode_rgb_jpeg(color_image)
+        self._latest_depth_meters = depth_image.copy()
+        self._latest_frame_timestamp = _frame_timestamp(depth)
+        self._latest_frame_number = _frame_number(depth)
         colors = color_image.reshape(-1, 3)
 
         points, colors = _filter_camera_points(
@@ -477,6 +506,20 @@ class RealSensePointCloudReader(CameraPointCloudReader):
 
     def latest_color_rgb(self) -> np.ndarray | None:
         return None if self._latest_color_rgb is None else self._latest_color_rgb.copy()
+
+    def latest_calibration_frame(self) -> CalibrationCameraFrame | None:
+        if self._latest_color_rgb is None or self._latest_depth_meters is None:
+            return None
+        descriptor = self.descriptor()
+        if descriptor is None:
+            return None
+        return CalibrationCameraFrame(
+            image_rgb=self._latest_color_rgb.copy(),
+            depth_meters=self._latest_depth_meters.copy(),
+            descriptor=descriptor,
+            timestamp=self._latest_frame_timestamp,
+            frame_number=self._latest_frame_number,
+        )
 
     def descriptor(self) -> CameraDescriptor | None:
         if self._profile is None or self._rs is None:
@@ -631,6 +674,26 @@ def _filter_camera_points(
         points = points[::downsample]
         colors = colors[::downsample]
     return points.astype(np.float32, copy=False), colors.astype(np.uint8, copy=False)
+
+
+def _frame_timestamp(frame) -> float | None:
+    getter = getattr(frame, "get_timestamp", None)
+    if not callable(getter):
+        return None
+    try:
+        return float(getter())
+    except Exception:
+        return None
+
+
+def _frame_number(frame) -> int | None:
+    getter = getattr(frame, "get_frame_number", None)
+    if not callable(getter):
+        return None
+    try:
+        return int(getter())
+    except Exception:
+        return None
 
 
 def _zed_enum(enum_cls, value: str | None, default: str):

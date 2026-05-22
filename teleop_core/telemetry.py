@@ -49,13 +49,16 @@ def _dashboard_camera_feeds(source: PointCloudSource) -> list[dict[str, Any]]:
         url = raw.get("url")
         if not name or not urdf_link or not url:
             continue
-        clean.append({
+        feed = {
             "name": str(name),
             "urdf_link": str(urdf_link),
             "url": str(url),
             "width": int(raw.get("width", 0)),
             "height": int(raw.get("height", 0)),
-        })
+        }
+        if raw.get("calibration_url") is not None:
+            feed["calibration_url"] = str(raw["calibration_url"])
+        clean.append(feed)
     return clean
 
 

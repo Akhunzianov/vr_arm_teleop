@@ -6,6 +6,7 @@ import { WorkspaceLayer } from './modules/workspace_layer.js';
 import { XRMarkers } from './modules/xr_markers.js';
 import { StatusPanel } from './modules/status_panel.js';
 import { CalibrationView } from './modules/calibration_view.js';
+import { CalibrationDiagnosticsPanel } from './modules/calibration_diagnostics_panel.js';
 
 const scene = new DashboardScene(document.getElementById('viewport'));
 const robot = new RobotView(scene.world);
@@ -13,6 +14,9 @@ const cloud = new DashboardPointCloudView(scene.world);
 const workspace = new WorkspaceLayer(scene.world);
 const xr = new XRMarkers(scene.world);
 const calibration = new CalibrationView(scene.world);
+const calibrationDiagnostics = new CalibrationDiagnosticsPanel(
+  document.getElementById('calibration-feeds'),
+);
 const status = new StatusPanel(
   document.getElementById('status'),
   document.getElementById('connection'),
@@ -46,6 +50,7 @@ comms.onJson = msg => {
   robot.applyJoints(msg.robot.joints);
   xr.update(msg.xr);
   calibration.update(msg.calibration);
+  calibrationDiagnostics.update(msg);
   status.update(msg);
 };
 comms.onBinary = buf => cloud.ingest(buf);

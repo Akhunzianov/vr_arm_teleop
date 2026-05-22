@@ -41,6 +41,7 @@ from teleop_backends.camera_calibration import (
     write_calibrated_hardware_config,
 )
 from teleop_backends.pointcloud.hardware import (
+    CalibrationCameraFrame,
     HardwareCameraConfig,
     HardwarePointCloudConfig,
     CameraPointCloudReader,
@@ -62,10 +63,22 @@ from teleop_core.workspace import Workspace
 
 @dataclass(frozen=True)
 class _Detection:
-    camera_from_board: np.ndarray
-    reprojection_error: float
-    corner_count: int
+    accepted: bool
+    reason: str | None
+    camera_from_board: np.ndarray | None
+    reprojection_error: float | None
+    marker_count: int
+    charuco_corner_count: int
+    depth_valid_corners: int
+    kabsch_rms_m: float | None
+    depth_range_m: tuple[float, float] | None
+    frame_timestamp: float | None
+    frame_number: int | None
     overlay_rgb: np.ndarray
+
+    @property
+    def corner_count(self) -> int:
+        return self.charuco_corner_count
 
 
 class JsonJointStateProvider(JointStateProvider):
@@ -98,6 +111,10 @@ class CalibrationPointCloudSource:
         board,
         cv2,
         min_corners: int,
+        min_depth_corners: int,
+        depth_neighborhood: int,
+        max_kabsch_rms_m: float,
+        max_arm_motion_per_sample_m: float,
         autosave: bool,
         reader_factory=default_reader_factory,
     ) -> None:
@@ -112,15 +129,24 @@ class CalibrationPointCloudSource:
         self._board = board
         self._cv2 = cv2
         self._min_corners = int(min_corners)
+        self._min_depth_corners = int(min_depth_corners)
+        self._depth_neighborhood = int(depth_neighborhood)
+        self._max_kabsch_rms_m = float(max_kabsch_rms_m)
+        self._max_arm_motion_per_sample_m = float(max_arm_motion_per_sample_m)
         self._autosave = bool(autosave)
         self._reader_factory = reader_factory
         self._readers: list[tuple[HardwareCameraConfig, CameraPointCloudReader]] = []
         self._descriptors: dict[str, CameraDescriptor] = {}
         self.latest_joint_state: dict[str, float] = {}
         self._latest_detections: dict[str, dict] = {}
+        self._latest_diagnostics: dict[str, dict] = {}
+        self._latest_calibration_jpegs: dict[str, bytes] = {}
         self._latest_transforms: dict[str, list[list[float]]] = {}
         self._latest_board_poses: dict[str, list[list[float]]] = {}
         self._latest_error: str | None = None
+        self._previous_world_from_anchor: np.ndarray | None = None
+        self._latest_arm_motion_m: float | None = None
+        self._latest_sample_rejected_reason: str | None = None
         self._autosave_state = "disabled" if not autosave else "waiting_for_stability"
         self._last_saved_timestamp: float | None = None
         self._saved_current_stable_set = False
@@ -153,6 +179,7 @@ class CalibrationPointCloudSource:
         raw_frames: list[tuple[HardwareCameraConfig, PointCloudFrame]] = []
         detections: dict[str, CalibrationDetection] = {}
         detection_status: dict[str, dict] = {}
+        diagnostics: dict[str, dict] = {}
 
         try:
             joint_state = await asyncio.to_thread(self._joint_provider.read_joint_state)
@@ -162,6 +189,11 @@ class CalibrationPointCloudSource:
                 self._camera_link,
                 joint_state,
             )
+            self._latest_arm_motion_m = _translation_delta(
+                self._previous_world_from_anchor,
+                world_from_anchor,
+            )
+            self._previous_world_from_anchor = world_from_anchor.copy()
             self._latest_error = None
         except Exception as exc:
             self._latest_error = repr(exc)
@@ -171,44 +203,50 @@ class CalibrationPointCloudSource:
             frame = await reader.grab_camera_frame()
             if frame is not None:
                 raw_frames.append((camera, frame))
-            image = reader.latest_color_rgb()
-            descriptor = self._descriptors.get(camera.name)
-            if image is None or descriptor is None:
-                detection_status[camera.name] = {
+            calibration_frame = reader.latest_calibration_frame()
+            if calibration_frame is None:
+                status = {
                     "detected": False,
-                    "reason": "frame_or_intrinsics_unavailable",
+                    "reason": "calibration_frame_unavailable",
                 }
+                detection_status[camera.name] = status
+                diagnostics[camera.name] = status
                 continue
             detection = _detect_board_pose(
                 self._cv2,
                 self._board,
-                image,
-                descriptor,
+                calibration_frame,
                 min_corners=self._min_corners,
+                min_depth_corners=self._min_depth_corners,
+                depth_neighborhood=self._depth_neighborhood,
+                max_kabsch_rms_m=self._max_kabsch_rms_m,
             )
-            if detection is None:
-                detection_status[camera.name] = {
-                    "detected": False,
-                    "reason": "board_not_found",
-                }
+            jpeg = _encode_rgb_jpeg(self._cv2, detection.overlay_rgb)
+            if jpeg is not None:
+                self._latest_calibration_jpegs[camera.name] = jpeg
+            status = _detection_status(detection)
+            detection_status[camera.name] = status
+            diagnostics[camera.name] = status
+            if not detection.accepted or detection.camera_from_board is None:
                 continue
             detections[camera.name] = CalibrationDetection(
                 camera_from_board=detection.camera_from_board,
-                reprojection_error=detection.reprojection_error,
+                reprojection_error=float(detection.reprojection_error or 0.0),
                 corner_count=detection.corner_count,
             )
-            detection_status[camera.name] = {
-                "detected": True,
-                "reprojection_error_px": detection.reprojection_error,
-                "corner_count": detection.corner_count,
-            }
 
         self._latest_detections = detection_status
-        self._optimizer.add_frame(
-            world_from_anchor_camera=world_from_anchor,
-            detections=detections,
-            timestamp=time.monotonic(),
+        self._latest_diagnostics = diagnostics
+        self._latest_sample_rejected_reason = _arm_motion_rejection_reason(
+            self._latest_arm_motion_m,
+            self._max_arm_motion_per_sample_m,
         )
+        if self._latest_sample_rejected_reason is None:
+            self._optimizer.add_frame(
+                world_from_anchor_camera=world_from_anchor,
+                detections=detections,
+                timestamp=time.monotonic(),
+            )
         self._maybe_autosave()
 
         transforms = self._optimizer.current_transforms(include_anchor=True)
@@ -253,6 +291,9 @@ class CalibrationPointCloudSource:
                 "name": camera.name,
                 "urdf_link": camera.urdf_link,
                 "url": f"/api/cameras/{quote(camera.name, safe='')}/color.jpg",
+                "calibration_url": (
+                    f"/api/cameras/{quote(camera.name, safe='')}/calibration.jpg"
+                ),
                 "width": int(camera.width),
                 "height": int(camera.height),
             })
@@ -263,6 +304,9 @@ class CalibrationPointCloudSource:
             if camera.name == camera_name:
                 return reader.latest_color_jpeg()
         return None
+
+    def latest_calibration_jpeg(self, camera_name: str) -> bytes | None:
+        return self._latest_calibration_jpegs.get(camera_name)
 
     def calibration_snapshot(self) -> dict:
         status = self._optimizer.status()
@@ -285,6 +329,9 @@ class CalibrationPointCloudSource:
             "cameras": cameras,
             "world_from_camera": self._latest_transforms,
             "world_from_board": self._latest_board_poses,
+            "diagnostics": self._latest_diagnostics,
+            "arm_motion_m": self._latest_arm_motion_m,
+            "sample_rejected_reason": self._latest_sample_rejected_reason,
             "autosave": {
                 "enabled": self._autosave,
                 "state": self._autosave_state,
@@ -369,7 +416,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     ap.add_argument("--min-samples", type=int, default=10)
     ap.add_argument("--min-corners", type=int, default=12)
+    ap.add_argument("--min-depth-corners", type=int, default=12)
     ap.add_argument("--max-reprojection-error", type=float, default=2.0)
+    ap.add_argument("--max-kabsch-rms", type=float, default=0.01)
+    ap.add_argument("--depth-neighborhood", type=int, default=2)
+    ap.add_argument("--max-arm-motion-per-sample", type=float, default=0.02)
     ap.add_argument("--rolling-window", type=int, default=40)
     ap.add_argument("--stability-seconds", type=float, default=2.0)
     ap.add_argument("--max-pair-translation-deviation", type=float, default=0.05)
@@ -443,6 +494,10 @@ async def run_continuous_calibration(args: argparse.Namespace) -> None:
         board=board,
         cv2=cv2,
         min_corners=args.min_corners,
+        min_depth_corners=args.min_depth_corners,
+        depth_neighborhood=args.depth_neighborhood,
+        max_kabsch_rms_m=args.max_kabsch_rms,
+        max_arm_motion_per_sample_m=args.max_arm_motion_per_sample,
         autosave=args.autosave,
     )
     workspace = _workspace_from_config(hardware_config)
@@ -525,6 +580,16 @@ def _make_dashboard_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def camera_calibration(request) -> web.Response:
+        image = source.latest_calibration_jpeg(request.match_info["name"])
+        if image is None:
+            return web.Response(status=404, text="calibration frame not ready")
+        return web.Response(
+            body=image,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def robot_asset(request) -> web.StreamResponse:
         try:
             path = _resolve_robot_asset_path(robot_assets_root, request.match_info["tail"])
@@ -586,6 +651,7 @@ def _make_dashboard_app(
     app.router.add_get("/ws", dashboard_ws)
     app.router.add_get("/api/snapshot", snapshot)
     app.router.add_get("/api/cameras/{name}/color.jpg", camera_color)
+    app.router.add_get("/api/cameras/{name}/calibration.jpg", camera_calibration)
     app.router.add_get("/robot/robot.urdf", lambda _request: web.FileResponse(urdf_path))
     app.router.add_get("/robot/assets/{tail:.*}", robot_asset)
     app.router.add_get("/", lambda _request: web.FileResponse(static_dir / "index.html"))
@@ -596,19 +662,31 @@ def _make_dashboard_app(
 def _detect_board_pose(
     cv2,
     board,
-    image_rgb: np.ndarray,
-    descriptor: CameraDescriptor,
+    frame: CalibrationCameraFrame,
     *,
     min_corners: int,
-) -> Optional[_Detection]:
+    min_depth_corners: int,
+    depth_neighborhood: int,
+    max_kabsch_rms_m: float,
+) -> _Detection:
+    image_rgb = np.asarray(frame.image_rgb, dtype=np.uint8)
+    depth_meters = np.asarray(frame.depth_meters, dtype=np.float32)
+    descriptor = frame.descriptor
     gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
     camera_matrix = np.asarray(descriptor.camera_matrix, dtype=np.float64)
     distortion = np.asarray(descriptor.distortion, dtype=np.float64)
     dictionary = board.getDictionary() if hasattr(board, "getDictionary") else board.dictionary
     marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
     overlay = image_rgb.copy()
+    marker_count = 0 if marker_ids is None else int(len(marker_ids))
     if marker_ids is None or len(marker_ids) == 0:
-        return None
+        return _detection_result(
+            accepted=False,
+            reason="markers_not_found",
+            overlay_rgb=overlay,
+            marker_count=marker_count,
+            frame=frame,
+        )
 
     cv2.aruco.drawDetectedMarkers(overlay, marker_corners, marker_ids)
     _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
@@ -619,40 +697,280 @@ def _detect_board_pose(
         cameraMatrix=camera_matrix,
         distCoeffs=distortion,
     )
-    if charuco_ids is None or charuco_corners is None or len(charuco_ids) < min_corners:
-        return None
+    charuco_count = 0 if charuco_ids is None else int(len(charuco_ids))
+    if charuco_ids is not None and charuco_corners is not None and charuco_count > 0:
+        cv2.aruco.drawDetectedCornersCharuco(overlay, charuco_corners, charuco_ids)
+    if charuco_ids is None or charuco_corners is None or charuco_count < min_corners:
+        return _detection_result(
+            accepted=False,
+            reason="not_enough_charuco_corners",
+            overlay_rgb=overlay,
+            marker_count=marker_count,
+            charuco_corner_count=charuco_count,
+            frame=frame,
+        )
 
-    ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-        charuco_corners,
-        charuco_ids,
-        board,
-        camera_matrix,
-        distortion,
-        None,
-        None,
+    if depth_meters.shape[:2] != gray.shape[:2]:
+        return _detection_result(
+            accepted=False,
+            reason="depth_shape_mismatch",
+            overlay_rgb=overlay,
+            marker_count=marker_count,
+            charuco_corner_count=charuco_count,
+            frame=frame,
+        )
+
+    object_points = _charuco_object_points(board, charuco_ids)
+    observed_pixels = np.asarray(charuco_corners, dtype=np.float64).reshape(-1, 2)
+    valid_object_points = []
+    valid_camera_points = []
+    valid_observed_pixels = []
+    valid_depths = []
+    for object_point, pixel in zip(object_points, observed_pixels):
+        depth = _sample_depth(depth_meters, pixel, depth_neighborhood)
+        if depth is None:
+            continue
+        valid_object_points.append(object_point)
+        valid_camera_points.append(_deproject_pixel(pixel, depth, camera_matrix))
+        valid_observed_pixels.append(pixel)
+        valid_depths.append(depth)
+
+    depth_valid_corners = len(valid_depths)
+    depth_range = (
+        (float(min(valid_depths)), float(max(valid_depths)))
+        if valid_depths
+        else None
     )
-    if not ok:
-        return None
-    rotation, _ = cv2.Rodrigues(rvec)
-    camera_from_board = transform_from_rt(rotation, np.asarray(tvec, dtype=np.float64).reshape(3))
-    reprojection_error = _charuco_reprojection_error(
+    if depth_valid_corners < min_depth_corners:
+        return _detection_result(
+            accepted=False,
+            reason="not_enough_valid_depth",
+            overlay_rgb=overlay,
+            marker_count=marker_count,
+            charuco_corner_count=charuco_count,
+            depth_valid_corners=depth_valid_corners,
+            depth_range_m=depth_range,
+            frame=frame,
+        )
+
+    camera_from_board, kabsch_rms = _kabsch_transform(
+        np.asarray(valid_object_points, dtype=np.float64),
+        np.asarray(valid_camera_points, dtype=np.float64),
+    )
+    rotation = camera_from_board[:3, :3]
+    translation = camera_from_board[:3, 3]
+    rvec, _ = cv2.Rodrigues(rotation)
+    tvec = translation.reshape(3, 1)
+    reprojection_error = _object_reprojection_error(
         cv2,
-        board,
-        charuco_corners,
-        charuco_ids,
+        np.asarray(valid_object_points, dtype=np.float64),
+        np.asarray(valid_observed_pixels, dtype=np.float64),
         rvec,
         tvec,
         camera_matrix,
         distortion,
     )
-    cv2.aruco.drawDetectedCornersCharuco(overlay, charuco_corners, charuco_ids)
     cv2.drawFrameAxes(overlay, camera_matrix, distortion, rvec, tvec, 0.05)
-    return _Detection(
+    if kabsch_rms > max_kabsch_rms_m:
+        return _detection_result(
+            accepted=False,
+            reason="kabsch_rms_too_high",
+            camera_from_board=camera_from_board,
+            reprojection_error=reprojection_error,
+            overlay_rgb=overlay,
+            marker_count=marker_count,
+            charuco_corner_count=charuco_count,
+            depth_valid_corners=depth_valid_corners,
+            kabsch_rms_m=kabsch_rms,
+            depth_range_m=depth_range,
+            frame=frame,
+        )
+    return _detection_result(
+        accepted=True,
+        reason=None,
         camera_from_board=camera_from_board,
         reprojection_error=reprojection_error,
-        corner_count=int(len(charuco_ids)),
         overlay_rgb=overlay,
+        marker_count=marker_count,
+        charuco_corner_count=charuco_count,
+        depth_valid_corners=depth_valid_corners,
+        kabsch_rms_m=kabsch_rms,
+        depth_range_m=depth_range,
+        frame=frame,
     )
+
+
+def _detection_result(
+    *,
+    accepted: bool,
+    reason: str | None,
+    overlay_rgb: np.ndarray,
+    marker_count: int,
+    frame: CalibrationCameraFrame,
+    camera_from_board: np.ndarray | None = None,
+    reprojection_error: float | None = None,
+    charuco_corner_count: int = 0,
+    depth_valid_corners: int = 0,
+    kabsch_rms_m: float | None = None,
+    depth_range_m: tuple[float, float] | None = None,
+) -> _Detection:
+    return _Detection(
+        accepted=bool(accepted),
+        reason=reason,
+        camera_from_board=camera_from_board,
+        reprojection_error=None if reprojection_error is None else float(reprojection_error),
+        marker_count=int(marker_count),
+        charuco_corner_count=int(charuco_corner_count),
+        depth_valid_corners=int(depth_valid_corners),
+        kabsch_rms_m=None if kabsch_rms_m is None else float(kabsch_rms_m),
+        depth_range_m=depth_range_m,
+        frame_timestamp=frame.timestamp,
+        frame_number=frame.frame_number,
+        overlay_rgb=overlay_rgb,
+    )
+
+
+def _charuco_object_points(board, charuco_ids) -> np.ndarray:
+    if hasattr(board, "getChessboardCorners"):
+        chessboard_corners = np.asarray(board.getChessboardCorners(), dtype=np.float64)
+    else:
+        chessboard_corners = np.asarray(board.chessboardCorners, dtype=np.float64)
+    ids = np.asarray(charuco_ids, dtype=np.int32).reshape(-1)
+    return chessboard_corners[ids]
+
+
+def _sample_depth(
+    depth_meters: np.ndarray,
+    pixel: np.ndarray,
+    neighborhood: int,
+) -> float | None:
+    x = int(round(float(pixel[0])))
+    y = int(round(float(pixel[1])))
+    radius = max(0, int(neighborhood))
+    height, width = depth_meters.shape[:2]
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return None
+    x0 = max(0, x - radius)
+    x1 = min(width, x + radius + 1)
+    y0 = max(0, y - radius)
+    y1 = min(height, y + radius + 1)
+    values = np.asarray(depth_meters[y0:y1, x0:x1], dtype=np.float32).reshape(-1)
+    values = values[np.isfinite(values) & (values > 0.0)]
+    if values.size == 0:
+        return None
+    return float(np.median(values))
+
+
+def _deproject_pixel(pixel: np.ndarray, depth_m: float, camera_matrix: np.ndarray) -> np.ndarray:
+    fx = float(camera_matrix[0, 0])
+    fy = float(camera_matrix[1, 1])
+    cx = float(camera_matrix[0, 2])
+    cy = float(camera_matrix[1, 2])
+    if fx == 0.0 or fy == 0.0:
+        raise ValueError("camera intrinsics require non-zero focal lengths")
+    x = (float(pixel[0]) - cx) * float(depth_m) / fx
+    y = (float(pixel[1]) - cy) * float(depth_m) / fy
+    return np.array([x, y, float(depth_m)], dtype=np.float64)
+
+
+def _kabsch_transform(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    source = np.asarray(source_points, dtype=np.float64).reshape(-1, 3)
+    target = np.asarray(target_points, dtype=np.float64).reshape(-1, 3)
+    if source.shape != target.shape or source.shape[0] < 3:
+        raise ValueError("Kabsch requires at least three paired 3D points")
+    source_centroid = np.mean(source, axis=0)
+    target_centroid = np.mean(target, axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+    covariance = source_centered.T @ target_centered
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0.0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+    translation = target_centroid - rotation @ source_centroid
+    transformed = (rotation @ source.T).T + translation
+    rms = float(np.sqrt(np.mean(np.sum((transformed - target) ** 2, axis=1))))
+    return transform_from_rt(rotation, translation), rms
+
+
+def _object_reprojection_error(
+    cv2,
+    object_points: np.ndarray,
+    observed_pixels: np.ndarray,
+    rvec,
+    tvec,
+    camera_matrix,
+    distortion,
+) -> float:
+    projected, _ = cv2.projectPoints(
+        np.asarray(object_points, dtype=np.float32),
+        rvec,
+        tvec,
+        camera_matrix,
+        distortion,
+    )
+    projected = projected.reshape(-1, 2)
+    observed = np.asarray(observed_pixels, dtype=np.float32).reshape(-1, 2)
+    return float(np.sqrt(np.mean(np.sum((projected - observed) ** 2, axis=1))))
+
+
+def _detection_status(detection: _Detection) -> dict:
+    return {
+        "detected": bool(detection.accepted),
+        "reason": detection.reason,
+        "marker_count": detection.marker_count,
+        "corner_count": detection.corner_count,
+        "charuco_corner_count": detection.charuco_corner_count,
+        "depth_valid_corners": detection.depth_valid_corners,
+        "kabsch_rms_m": detection.kabsch_rms_m,
+        "depth_range_m": (
+            None
+            if detection.depth_range_m is None
+            else [float(detection.depth_range_m[0]), float(detection.depth_range_m[1])]
+        ),
+        "reprojection_error_px": detection.reprojection_error,
+        "frame_timestamp": detection.frame_timestamp,
+        "frame_number": detection.frame_number,
+    }
+
+
+def _translation_delta(
+    previous: np.ndarray | None,
+    current: np.ndarray,
+) -> float | None:
+    if previous is None:
+        return None
+    return float(np.linalg.norm(current[:3, 3] - previous[:3, 3]))
+
+
+def _arm_motion_rejection_reason(
+    arm_motion_m: float | None,
+    max_arm_motion_m: float,
+) -> str | None:
+    if arm_motion_m is None or max_arm_motion_m <= 0.0:
+        return None
+    if arm_motion_m > max_arm_motion_m:
+        return "arm_motion_too_high"
+    return None
+
+
+def _encode_rgb_jpeg(cv2, image: np.ndarray) -> bytes | None:
+    rgb = np.asarray(image, dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return None
+    bgr = np.ascontiguousarray(rgb[:, :, :3][:, :, ::-1])
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 82],
+    )
+    if not ok:
+        return None
+    return encoded.tobytes()
 
 
 def _charuco_reprojection_error(

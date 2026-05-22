@@ -84,14 +84,32 @@ export class StatusPanel {
       const reproj = fmtNumber(target.reprojection_error_px, 2);
       return row(name, `${stable}, ${target.accepted_samples || 0} inliers, ${reproj}px`, cls);
     }).join('');
+    const diagnostics = calibration.diagnostics || {};
+    const diagnosticRows = Object.entries(diagnostics).map(([name, diagnostic]) => {
+      const cls = diagnostic.detected ? '' : 'warn';
+      const state = diagnostic.detected ? 'accepted' : (diagnostic.reason || 'rejected');
+      const corners = diagnostic.charuco_corner_count ?? diagnostic.corner_count ?? 0;
+      const depth = diagnostic.depth_valid_corners ?? 0;
+      const rms = diagnostic.kabsch_rms_m === null || diagnostic.kabsch_rms_m === undefined
+        ? 'none'
+        : `${fmtNumber(diagnostic.kabsch_rms_m, 4)}m`;
+      return row(`${name} det`, `${state}, ${corners}/${depth}, ${rms}`, cls);
+    }).join('');
     const error = calibration.error || 'none';
+    const sampleRejected = calibration.sample_rejected_reason || 'none';
+    const armMotion = calibration.arm_motion_m === null || calibration.arm_motion_m === undefined
+      ? 'none'
+      : `${fmtNumber(calibration.arm_motion_m, 4)}m`;
     return `
       <div class="status-group">
         ${row('Cal mode', calibration.mode || 'none')}
         ${row('Anchor', calibration.anchor_camera || 'none')}
         ${row('Autosave', autosave.state || 'none', autosave.state === 'saved' ? '' : 'warn')}
         ${row('All stable', calibration.all_stable ? 'yes' : 'no', calibration.all_stable ? '' : 'warn')}
+        ${row('Arm motion', armMotion, calibration.sample_rejected_reason ? 'warn' : '')}
+        ${row('Sample gate', sampleRejected, calibration.sample_rejected_reason ? 'warn' : '')}
         ${targetRows}
+        ${diagnosticRows}
         ${row('Cal error', error, calibration.error ? 'error' : '')}
       </div>
     `;

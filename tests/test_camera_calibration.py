@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from scripts.calibrate_two_cameras_charuco import _detect_board_pose
 from teleop_backends.camera_calibration import (
     AnchoredExtrinsicOptimizer,
     CameraDescriptor,
@@ -24,6 +25,7 @@ from teleop_backends.camera_calibration import (
     transform_from_rt,
     write_calibrated_hardware_config,
 )
+from teleop_backends.pointcloud.hardware import CalibrationCameraFrame
 from teleop_backends.pointcloud.hardware import load_hardware_config
 
 
@@ -403,3 +405,120 @@ def test_write_calibrated_hardware_config_preserves_fields_and_creates_backup(tm
     assert written["cameras"][0]["world_from_camera"] == world_from_d405.tolist()
     assert written["cameras"][0]["extrinsic_world_from_cam"] == world_from_d405.tolist()
     assert written["cameras"][1] == original["cameras"][1]
+
+
+def _synthetic_charuco_scene(*, depth: float = 0.4):
+    cv2 = importlib.import_module("cv2")
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+    board = cv2.aruco.CharucoBoard((5, 4), 0.04, 0.03, dictionary)
+    gray = board.generateImage((500, 400), marginSize=0)
+    rgb = np.repeat(gray[:, :, None], 3, axis=2).astype(np.uint8)
+    depth_m = np.full(gray.shape, depth, dtype=np.float32)
+    descriptor = CameraDescriptor(
+        name="synthetic",
+        camera_type="realsense",
+        serial=None,
+        width=500,
+        height=400,
+        fps=30,
+        camera_matrix=[
+            [1000.0, 0.0, 0.0],
+            [0.0, 1000.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    frame = CalibrationCameraFrame(
+        image_rgb=rgb,
+        depth_meters=depth_m,
+        descriptor=descriptor,
+        timestamp=123.0,
+        frame_number=456,
+    )
+    return cv2, board, frame
+
+
+def test_detect_board_pose_reports_partial_charuco_when_depth_is_missing():
+    cv2, board, frame = _synthetic_charuco_scene()
+    frame = CalibrationCameraFrame(
+        image_rgb=frame.image_rgb,
+        depth_meters=np.zeros_like(frame.depth_meters),
+        descriptor=frame.descriptor,
+        timestamp=frame.timestamp,
+        frame_number=frame.frame_number,
+    )
+
+    detection = _detect_board_pose(
+        cv2,
+        board,
+        frame,
+        min_corners=8,
+        min_depth_corners=6,
+        depth_neighborhood=1,
+        max_kabsch_rms_m=0.005,
+    )
+
+    assert detection.accepted is False
+    assert detection.reason == "not_enough_valid_depth"
+    assert detection.marker_count > 0
+    assert detection.charuco_corner_count >= 8
+    assert detection.depth_valid_corners == 0
+    assert detection.overlay_rgb.shape == frame.image_rgb.shape
+
+
+def test_detect_board_pose_uses_depth_kabsch_to_recover_camera_from_board():
+    cv2, board, frame = _synthetic_charuco_scene(depth=0.4)
+
+    detection = _detect_board_pose(
+        cv2,
+        board,
+        frame,
+        min_corners=8,
+        min_depth_corners=8,
+        depth_neighborhood=1,
+        max_kabsch_rms_m=0.005,
+    )
+
+    assert detection.accepted is True
+    assert detection.camera_from_board is not None
+    assert detection.depth_valid_corners >= 8
+    assert detection.kabsch_rms_m is not None
+    assert detection.kabsch_rms_m < 0.005
+    assert np.allclose(
+        detection.camera_from_board[:3, :3],
+        np.eye(3),
+        atol=0.03,
+    )
+    assert np.allclose(
+        detection.camera_from_board[:3, 3],
+        [0.0, 0.0, 0.4],
+        atol=0.015,
+    )
+
+
+def test_detect_board_pose_rejects_high_depth_kabsch_rms():
+    cv2, board, frame = _synthetic_charuco_scene(depth=0.4)
+    noisy_depth = frame.depth_meters.copy()
+    noisy_depth[:200, :] = 0.6
+    frame = CalibrationCameraFrame(
+        image_rgb=frame.image_rgb,
+        depth_meters=noisy_depth,
+        descriptor=frame.descriptor,
+        timestamp=frame.timestamp,
+        frame_number=frame.frame_number,
+    )
+
+    detection = _detect_board_pose(
+        cv2,
+        board,
+        frame,
+        min_corners=8,
+        min_depth_corners=8,
+        depth_neighborhood=1,
+        max_kabsch_rms_m=0.001,
+    )
+
+    assert detection.accepted is False
+    assert detection.reason == "kabsch_rms_too_high"
+    assert detection.kabsch_rms_m is not None
+    assert detection.kabsch_rms_m > 0.001
